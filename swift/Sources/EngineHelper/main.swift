@@ -235,7 +235,16 @@ private final class EngineCoordinator {
     private var elevenSttReceiveWorkItem: DispatchWorkItem?
     private var activeSttStreamID: String?
 
-    private var elevenTtsSockets: [String: URLSessionWebSocketTask] = [:]
+    private var enabled = false
+    private var elevenTtsSocket: URLSessionWebSocketTask?
+    private var activeUtteranceID: String?
+
+    private struct PendingUtterance {
+        let id: String
+        var text: String
+        var flushed: Bool
+    }
+    private var pendingUtterances: [PendingUtterance] = []
     private var activeSynthesizer: AVSpeechSynthesizer?
     private var warmSynthesizer: AVSpeechSynthesizer?
     private var ttsConverter: AVAudioConverter?
@@ -289,6 +298,10 @@ private final class EngineCoordinator {
             applyEngineConfig(command)
         case "session_config":
             applySessionConfig(command)
+        case "enable":
+            handleEnable()
+        case "disable":
+            handleDisable()
         case "tts_start":
             handleTtsStart(command)
         case "tts_chunk":
@@ -398,6 +411,32 @@ private final class EngineCoordinator {
         }
     }
 
+    private func handleEnable() {
+        stateQueue.sync { enabled = true }
+        emitter.emit(["type": "enabled"])
+    }
+
+    private func handleDisable() {
+        let socket = stateQueue.sync { () -> URLSessionWebSocketTask? in
+            enabled = false
+            activeUtteranceID = nil
+            pendingUtterances.removeAll()
+            let s = elevenTtsSocket
+            elevenTtsSocket = nil
+            return s
+        }
+        socket?.cancel(with: .normalClosure, reason: nil)
+
+        // Stop any active STT
+        if sessionMode == "elevenlabs" {
+            stopElevenLabsSTT(streamID: activeSttStreamID ?? "stt-default")
+        } else {
+            stopAppleSTT(streamID: activeSttStreamID ?? "stt-default")
+        }
+
+        emitter.emit(["type": "disabled"])
+    }
+
     private func handleTtsStart(_ command: [String: Any]) {
         guard let utteranceID = command["utterance_id"] as? String, !utteranceID.isEmpty else {
             emitError(code: "missing_utterance_id", message: "tts_start requires utterance_id")
@@ -406,12 +445,24 @@ private final class EngineCoordinator {
         let language = command["language"] as? String
 
         if sessionMode == "elevenlabs" {
-            stateQueue.sync {
+            let canActivate = stateQueue.sync { () -> Bool in
                 if let language, !language.isEmpty {
                     utteranceLanguages[utteranceID] = language
                 }
+                if activeUtteranceID == nil {
+                    activeUtteranceID = utteranceID
+                    return true
+                } else {
+                    pendingUtterances.append(PendingUtterance(id: utteranceID, text: "", flushed: false))
+                    return false
+                }
             }
-            openElevenLabsTTSStream(utteranceID: utteranceID)
+            if canActivate {
+                emitTtsStatus(utteranceID: utteranceID, status: "started", message: "elevenlabs tts started")
+                openElevenLabsTTSSocket()
+            } else {
+                emitTtsStatus(utteranceID: utteranceID, status: "queued", message: "queued behind active utterance")
+            }
         } else {
             stateQueue.sync {
                 utteranceBuffers[utteranceID] = ""
@@ -432,12 +483,22 @@ private final class EngineCoordinator {
         }
 
         if sessionMode == "elevenlabs" {
-            // Stream text directly to ElevenLabs — no buffering
-            guard let socket = stateQueue.sync(execute: { elevenTtsSockets[utteranceID] }) else { return }
-            let msg = Self.serialize(["text": text, "try_trigger_generation": true])
-            socket.send(.string(msg)) { [weak self] error in
-                if let error {
-                    self?.emitError(code: "eleven_tts_chunk_error", message: error.localizedDescription)
+            let (isActive, socket) = stateQueue.sync { () -> (Bool, URLSessionWebSocketTask?) in
+                if activeUtteranceID == utteranceID {
+                    return (true, elevenTtsSocket)
+                }
+                // Buffer text for queued utterance
+                if let idx = pendingUtterances.firstIndex(where: { $0.id == utteranceID }) {
+                    pendingUtterances[idx].text += text
+                }
+                return (false, nil)
+            }
+            if isActive, let socket {
+                let msg = Self.serialize(["text": text, "try_trigger_generation": true])
+                socket.send(.string(msg)) { [weak self] error in
+                    if let error {
+                        self?.emitError(code: "eleven_tts_chunk_error", message: error.localizedDescription)
+                    }
                 }
             }
         } else {
@@ -455,15 +516,22 @@ private final class EngineCoordinator {
         }
 
         if sessionMode == "elevenlabs" {
-            // Send flush signal — receive loop handles completion
-            guard let socket = stateQueue.sync(execute: { elevenTtsSockets[utteranceID] }) else {
-                emitTtsStatus(utteranceID: utteranceID, status: "completed", message: "no active stream")
-                return
+            let (isActive, socket) = stateQueue.sync { () -> (Bool, URLSessionWebSocketTask?) in
+                if activeUtteranceID == utteranceID {
+                    return (true, elevenTtsSocket)
+                }
+                // Mark queued utterance as flushed
+                if let idx = pendingUtterances.firstIndex(where: { $0.id == utteranceID }) {
+                    pendingUtterances[idx].flushed = true
+                }
+                return (false, nil)
             }
-            let msg = Self.serialize(["text": "", "flush": true])
-            socket.send(.string(msg)) { [weak self] error in
-                if let error {
-                    self?.emitError(code: "eleven_tts_flush_error", message: error.localizedDescription)
+            if isActive, let socket {
+                let msg = Self.serialize(["text": "", "flush": true])
+                socket.send(.string(msg)) { [weak self] error in
+                    if let error {
+                        self?.emitError(code: "eleven_tts_flush_error", message: error.localizedDescription)
+                    }
                 }
             }
         } else {
@@ -487,13 +555,36 @@ private final class EngineCoordinator {
             return
         }
 
-        let socket = stateQueue.sync { () -> URLSessionWebSocketTask? in
-            utteranceBuffers.removeValue(forKey: utteranceID)
-            utteranceLanguages.removeValue(forKey: utteranceID)
-            return elevenTtsSockets.removeValue(forKey: utteranceID)
+        if sessionMode == "elevenlabs" {
+            let isActive = stateQueue.sync { () -> Bool in
+                utteranceLanguages.removeValue(forKey: utteranceID)
+                if activeUtteranceID == utteranceID {
+                    return true
+                }
+                // Remove from queue if pending
+                pendingUtterances.removeAll { $0.id == utteranceID }
+                return false
+            }
+
+            if isActive {
+                let socket = stateQueue.sync { () -> URLSessionWebSocketTask? in
+                    activeUtteranceID = nil
+                    let s = elevenTtsSocket
+                    elevenTtsSocket = nil
+                    return s
+                }
+                socket?.cancel(with: .normalClosure, reason: nil)
+
+                // Drain next queued utterance
+                drainPendingUtterances()
+            }
+        } else {
+            stateQueue.sync {
+                utteranceBuffers.removeValue(forKey: utteranceID)
+                utteranceLanguages.removeValue(forKey: utteranceID)
+            }
         }
 
-        socket?.cancel(with: .normalClosure, reason: nil)
         emitTtsStatus(utteranceID: utteranceID, status: "completed", message: "cancelled")
     }
 
@@ -745,16 +836,18 @@ private final class EngineCoordinator {
         }
     }
 
-    private func openElevenLabsTTSStream(utteranceID: String) {
+    /// Open a fresh ElevenLabs TTS WebSocket, send BOS, start receive loop.
+    /// Optionally send pre-buffered text + flush (for queued utterances).
+    private func openElevenLabsTTSSocket(text: String? = nil, flush: Bool = false) {
         let cfg = config
         if cfg.elevenApiKey.isEmpty {
-            emitTtsStatus(utteranceID: utteranceID, status: "error", message: "ELEVENLABS_API_KEY missing")
+            emitError(code: "missing_api_key", message: "ELEVENLABS_API_KEY missing")
             return
         }
 
         let endpoint = "wss://api.elevenlabs.io/v1/text-to-speech/\(cfg.elevenTtsVoiceID)/stream-input"
         guard var components = URLComponents(string: endpoint) else {
-            emitTtsStatus(utteranceID: utteranceID, status: "error", message: "invalid elevenlabs tts endpoint")
+            emitError(code: "eleven_tts_url", message: "invalid elevenlabs tts endpoint")
             return
         }
         components.queryItems = [
@@ -762,7 +855,7 @@ private final class EngineCoordinator {
             URLQueryItem(name: "output_format", value: cfg.elevenTtsOutputFormat),
         ]
         guard let url = components.url else {
-            emitTtsStatus(utteranceID: utteranceID, status: "error", message: "invalid elevenlabs tts url")
+            emitError(code: "eleven_tts_url", message: "invalid elevenlabs tts url")
             return
         }
 
@@ -773,10 +866,10 @@ private final class EngineCoordinator {
         socket.resume()
 
         stateQueue.sync {
-            elevenTtsSockets[utteranceID] = socket
+            elevenTtsSocket = socket
         }
 
-        // Send BOS (beginning of stream) init message
+        // Send BOS
         let bos = Self.serialize([
             "text": " ",
             "xi_api_key": cfg.elevenApiKey,
@@ -787,17 +880,38 @@ private final class EngineCoordinator {
         ])
         socket.send(.string(bos)) { [weak self] error in
             if let error {
-                self?.emitTtsStatus(utteranceID: utteranceID, status: "error", message: "bos send: \(error.localizedDescription)")
+                self?.emitError(code: "eleven_tts_bos_error", message: error.localizedDescription)
             }
         }
 
-        emitTtsStatus(utteranceID: utteranceID, status: "started", message: "elevenlabs tts stream started")
+        // Send pre-buffered text + flush for queued utterances
+        if let text, !text.isEmpty {
+            let msg = Self.serialize(["text": text, "try_trigger_generation": true])
+            socket.send(.string(msg)) { _ in }
+        }
+        if flush {
+            let msg = Self.serialize(["text": "", "flush": true])
+            socket.send(.string(msg)) { _ in }
+        }
 
-        // Start async receive loop — runs concurrently with text chunk sends
-        elevenLabsTTSReceiveLoop(utteranceID: utteranceID, socket: socket, cfg: cfg)
+        // Start async receive loop
+        elevenLabsTTSReceiveLoop(socket: socket, cfg: cfg)
     }
 
-    private func elevenLabsTTSReceiveLoop(utteranceID: String, socket: URLSessionWebSocketTask, cfg: EngineConfig) {
+    private func drainPendingUtterances() {
+        let next = stateQueue.sync { () -> PendingUtterance? in
+            guard let first = pendingUtterances.first, first.flushed else { return nil }
+            pendingUtterances.removeFirst()
+            activeUtteranceID = first.id
+            return first
+        }
+        guard let next else { return }
+
+        emitTtsStatus(utteranceID: next.id, status: "started", message: "elevenlabs tts started")
+        openElevenLabsTTSSocket(text: next.text, flush: true)
+    }
+
+    private func elevenLabsTTSReceiveLoop(socket: URLSessionWebSocketTask, cfg: EngineConfig) {
         socket.receive { [weak self] result in
             guard let self else { return }
             switch result {
@@ -810,9 +924,11 @@ private final class EngineCoordinator {
                 }
 
                 guard let obj = self.parseJSON(textPayload) else {
-                    self.elevenLabsTTSReceiveLoop(utteranceID: utteranceID, socket: socket, cfg: cfg)
+                    self.elevenLabsTTSReceiveLoop(socket: socket, cfg: cfg)
                     return
                 }
+
+                let utteranceID = self.stateQueue.sync { self.activeUtteranceID } ?? "unknown"
 
                 if let audioBase64 = obj["audio"] as? String,
                    let audioData = Data(base64Encoded: audioBase64)
@@ -840,20 +956,30 @@ private final class EngineCoordinator {
 
                 if let isFinal = obj["isFinal"] as? Bool, isFinal {
                     socket.cancel(with: .normalClosure, reason: nil)
-                    _ = self.stateQueue.sync { self.elevenTtsSockets.removeValue(forKey: utteranceID) }
-                    self.emitTtsStatus(utteranceID: utteranceID, status: "completed", message: "elevenlabs tts completed")
+                    let uid = self.stateQueue.sync { () -> String? in
+                        let uid = self.activeUtteranceID
+                        self.activeUtteranceID = nil
+                        self.elevenTtsSocket = nil
+                        return uid
+                    }
+                    self.emitTtsStatus(utteranceID: uid ?? "unknown", status: "completed", message: "elevenlabs tts completed")
+
+                    // Process next queued utterance
+                    self.drainPendingUtterances()
                     return
                 }
 
-                // Continue receiving
-                self.elevenLabsTTSReceiveLoop(utteranceID: utteranceID, socket: socket, cfg: cfg)
+                self.elevenLabsTTSReceiveLoop(socket: socket, cfg: cfg)
 
             case .failure(let error):
-                // Socket was cancelled (e.g. tts_cancel) — not an error
-                let wasCancelled = self.stateQueue.sync { self.elevenTtsSockets[utteranceID] == nil }
+                // Socket was cancelled (e.g. disable or tts_cancel) — not an error
+                let wasCancelled = self.stateQueue.sync { self.elevenTtsSocket == nil }
                 if !wasCancelled {
-                    _ = self.stateQueue.sync { self.elevenTtsSockets.removeValue(forKey: utteranceID) }
-                    self.emitTtsStatus(utteranceID: utteranceID, status: "error", message: error.localizedDescription)
+                    let uid = self.stateQueue.sync {
+                        self.elevenTtsSocket = nil
+                        return self.activeUtteranceID
+                    }
+                    self.emitTtsStatus(utteranceID: uid ?? "unknown", status: "error", message: error.localizedDescription)
                 }
             }
         }
@@ -997,13 +1123,15 @@ private final class EngineCoordinator {
         ttsConverter = nil
         ttsConverterSourceFormat = nil
 
-        let ttsSockets = stateQueue.sync { () -> [URLSessionWebSocketTask] in
-            let values = Array(elevenTtsSockets.values)
-            elevenTtsSockets.removeAll()
-            return values
+        let ttsSocket = stateQueue.sync { () -> URLSessionWebSocketTask? in
+            enabled = false
+            activeUtteranceID = nil
+            pendingUtterances.removeAll()
+            let s = elevenTtsSocket
+            elevenTtsSocket = nil
+            return s
         }
-
-        ttsSockets.forEach { $0.cancel(with: .normalClosure, reason: nil) }
+        ttsSocket?.cancel(with: .normalClosure, reason: nil)
 
         stopAppleSTT(streamID: activeSttStreamID ?? "stt-default")
         stopElevenLabsSTT(streamID: activeSttStreamID ?? "stt-default")

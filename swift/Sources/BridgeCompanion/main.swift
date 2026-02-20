@@ -153,6 +153,7 @@ final class CompanionViewModel: ObservableObject {
     @Published var transcriptText: String = ""
     @Published var sttRunning: Bool = false
     @Published var sessionReady: Bool = false
+    @Published var bridgeEnabled: Bool = false
     @Published var micFeedLevel: Float = 0
     @Published var speakerTapLevel: Float = 0
 
@@ -202,7 +203,25 @@ final class CompanionViewModel: ObservableObject {
 
         sttRunning = false
         sessionReady = false
+        bridgeEnabled = false
         status = "Disconnected"
+    }
+
+    func enableBridge() {
+        send(["type": "enable"])
+        finalTranscriptLines.removeAll()
+        partialLine = ""
+        transcriptText = ""
+        sttRunning = true
+        send(["type": "start_stt", "stream_id": "s1", "language": language])
+        appendLog("[info] enable requested")
+    }
+
+    func disableBridge() {
+        send(["type": "stop_stt", "stream_id": "s1"])
+        sttRunning = false
+        send(["type": "disable"])
+        appendLog("[info] disable requested")
     }
 
     func sendText() {
@@ -336,6 +355,13 @@ final class CompanionViewModel: ObservableObject {
             let mode = (dict["mode"] as? String) ?? "unknown"
             sessionReady = true
             appendLog("[info] session mode applied: \(mode)")
+        case "enabled":
+            bridgeEnabled = true
+            appendLog("[info] bridge enabled")
+        case "disabled":
+            bridgeEnabled = false
+            sttRunning = false
+            appendLog("[info] bridge disabled")
         case "tts_status":
             let id = (dict["utterance_id"] as? String) ?? "?"
             let st = (dict["status"] as? String) ?? "?"
@@ -454,6 +480,15 @@ struct ContentView: View {
                 Button("Connect") { viewModel.connect() }
                 Button("Disconnect") { viewModel.disconnect() }
                 Button("Apply Mode") { viewModel.applySessionConfig() }
+                Button(viewModel.bridgeEnabled ? "Disable" : "Enable") {
+                    if viewModel.bridgeEnabled {
+                        viewModel.disableBridge()
+                    } else {
+                        viewModel.enableBridge()
+                    }
+                }
+                .disabled(!viewModel.sessionReady)
+                .foregroundColor(viewModel.bridgeEnabled ? .red : .green)
             }
 
             HStack(spacing: 6) {
@@ -461,6 +496,11 @@ struct ContentView: View {
                     .font(.caption)
                 if viewModel.sessionReady {
                     Text("Engine Ready")
+                        .font(.caption)
+                        .foregroundColor(.green)
+                }
+                if viewModel.bridgeEnabled {
+                    Text("Enabled")
                         .font(.caption)
                         .foregroundColor(.green)
                 }
@@ -484,22 +524,7 @@ struct ContentView: View {
             // Buttons
             HStack {
                 Button("Send TTS") { viewModel.sendText() }
-                    .disabled(!viewModel.sessionReady)
-                Spacer().frame(width: 20)
-                Button(viewModel.sttRunning ? "Stop STT" : "Start STT") {
-                    if viewModel.sttRunning {
-                        viewModel.stopSTT()
-                    } else {
-                        viewModel.startSTT()
-                    }
-                }
-                .disabled(!viewModel.sessionReady && !viewModel.sttRunning)
-                .foregroundColor(viewModel.sttRunning ? .red : .primary)
-                if viewModel.sttRunning {
-                    Text("STT active")
-                        .font(.caption)
-                        .foregroundColor(.green)
-                }
+                    .disabled(!viewModel.bridgeEnabled)
             }
 
             // STT Transcript

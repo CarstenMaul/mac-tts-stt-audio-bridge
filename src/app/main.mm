@@ -1291,6 +1291,7 @@ class BridgeService {
     }
 
     static const std::vector<std::string> allowed_forward_types = {
+        "enable", "disable",
         "tts_start", "tts_chunk", "tts_flush", "tts_cancel", "start_stt", "stop_stt"};
 
     if (std::find(allowed_forward_types.begin(), allowed_forward_types.end(), type) ==
