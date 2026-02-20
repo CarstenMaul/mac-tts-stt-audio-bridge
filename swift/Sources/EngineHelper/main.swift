@@ -235,7 +235,7 @@ private final class EngineCoordinator {
     private var elevenSttReceiveWorkItem: DispatchWorkItem?
     private var activeSttStreamID: String?
 
-    private var elevenTtsWorkItems: [String: DispatchWorkItem] = [:]
+    private var elevenTtsSockets: [String: URLSessionWebSocketTask] = [:]
     private var activeSynthesizer: AVSpeechSynthesizer?
     private var warmSynthesizer: AVSpeechSynthesizer?
     private var ttsConverter: AVAudioConverter?
@@ -404,13 +404,23 @@ private final class EngineCoordinator {
             return
         }
         let language = command["language"] as? String
-        stateQueue.sync {
-            utteranceBuffers[utteranceID] = ""
-            if let language, !language.isEmpty {
-                utteranceLanguages[utteranceID] = language
+
+        if sessionMode == "elevenlabs" {
+            stateQueue.sync {
+                if let language, !language.isEmpty {
+                    utteranceLanguages[utteranceID] = language
+                }
             }
+            openElevenLabsTTSStream(utteranceID: utteranceID)
+        } else {
+            stateQueue.sync {
+                utteranceBuffers[utteranceID] = ""
+                if let language, !language.isEmpty {
+                    utteranceLanguages[utteranceID] = language
+                }
+            }
+            emitTtsStatus(utteranceID: utteranceID, status: "queued", message: "queued")
         }
-        emitTtsStatus(utteranceID: utteranceID, status: "queued", message: "queued")
     }
 
     private func handleTtsChunk(_ command: [String: Any]) {
@@ -421,9 +431,20 @@ private final class EngineCoordinator {
             return
         }
 
-        stateQueue.sync {
-            let existing = utteranceBuffers[utteranceID] ?? ""
-            utteranceBuffers[utteranceID] = existing + text
+        if sessionMode == "elevenlabs" {
+            // Stream text directly to ElevenLabs — no buffering
+            guard let socket = stateQueue.sync(execute: { elevenTtsSockets[utteranceID] }) else { return }
+            let msg = Self.serialize(["text": text, "try_trigger_generation": true])
+            socket.send(.string(msg)) { [weak self] error in
+                if let error {
+                    self?.emitError(code: "eleven_tts_chunk_error", message: error.localizedDescription)
+                }
+            }
+        } else {
+            stateQueue.sync {
+                let existing = utteranceBuffers[utteranceID] ?? ""
+                utteranceBuffers[utteranceID] = existing + text
+            }
         }
     }
 
@@ -433,20 +454,30 @@ private final class EngineCoordinator {
             return
         }
 
-        let (text, language) = stateQueue.sync {
-            let t = utteranceBuffers.removeValue(forKey: utteranceID) ?? ""
-            let l = utteranceLanguages.removeValue(forKey: utteranceID)
-            return (t, l)
-        }
-
-        if text.isEmpty {
-            emitTtsStatus(utteranceID: utteranceID, status: "completed", message: "empty utterance")
-            return
-        }
-
         if sessionMode == "elevenlabs" {
-            runElevenLabsTTS(utteranceID: utteranceID, text: text)
+            // Send flush signal — receive loop handles completion
+            guard let socket = stateQueue.sync(execute: { elevenTtsSockets[utteranceID] }) else {
+                emitTtsStatus(utteranceID: utteranceID, status: "completed", message: "no active stream")
+                return
+            }
+            let msg = Self.serialize(["text": "", "flush": true])
+            socket.send(.string(msg)) { [weak self] error in
+                if let error {
+                    self?.emitError(code: "eleven_tts_flush_error", message: error.localizedDescription)
+                }
+            }
         } else {
+            let (text, language) = stateQueue.sync {
+                let t = utteranceBuffers.removeValue(forKey: utteranceID) ?? ""
+                let l = utteranceLanguages.removeValue(forKey: utteranceID)
+                return (t, l)
+            }
+
+            if text.isEmpty {
+                emitTtsStatus(utteranceID: utteranceID, status: "completed", message: "empty utterance")
+                return
+            }
+
             runAppleTTS(utteranceID: utteranceID, text: text, language: language)
         }
     }
@@ -456,13 +487,13 @@ private final class EngineCoordinator {
             return
         }
 
-        let workItem = stateQueue.sync { () -> DispatchWorkItem? in
+        let socket = stateQueue.sync { () -> URLSessionWebSocketTask? in
             utteranceBuffers.removeValue(forKey: utteranceID)
             utteranceLanguages.removeValue(forKey: utteranceID)
-            return elevenTtsWorkItems.removeValue(forKey: utteranceID)
+            return elevenTtsSockets.removeValue(forKey: utteranceID)
         }
 
-        workItem?.cancel()
+        socket?.cancel(with: .normalClosure, reason: nil)
         emitTtsStatus(utteranceID: utteranceID, status: "completed", message: "cancelled")
     }
 
@@ -714,117 +745,118 @@ private final class EngineCoordinator {
         }
     }
 
-    private func runElevenLabsTTS(utteranceID: String, text: String) {
-        if config.elevenApiKey.isEmpty {
+    private func openElevenLabsTTSStream(utteranceID: String) {
+        let cfg = config
+        if cfg.elevenApiKey.isEmpty {
             emitTtsStatus(utteranceID: utteranceID, status: "error", message: "ELEVENLABS_API_KEY missing")
             return
         }
 
-        emitTtsStatus(utteranceID: utteranceID, status: "started", message: "elevenlabs tts started")
-
-        let cfg = config
-        var workItem: DispatchWorkItem?
-        workItem = DispatchWorkItem { [weak self] in
-            guard let self else { return }
-            do {
-                let endpoint = "wss://api.elevenlabs.io/v1/text-to-speech/\(cfg.elevenTtsVoiceID)/stream-input"
-                guard var components = URLComponents(string: endpoint) else {
-                    throw NSError(domain: "engine_helper", code: 1, userInfo: [NSLocalizedDescriptionKey: "invalid elevenlabs tts endpoint"])
-                }
-                components.queryItems = [
-                    URLQueryItem(name: "model_id", value: cfg.elevenTtsModelID),
-                    URLQueryItem(name: "output_format", value: cfg.elevenTtsOutputFormat),
-                ]
-                guard let url = components.url else {
-                    throw NSError(domain: "engine_helper", code: 2, userInfo: [NSLocalizedDescriptionKey: "invalid elevenlabs tts url"])
-                }
-
-                var request = URLRequest(url: url)
-                request.setValue(cfg.elevenApiKey, forHTTPHeaderField: "xi-api-key")
-
-                let socket = URLSession.shared.webSocketTask(with: request)
-                socket.resume()
-
-                try self.wsSendSync(socket, text: Self.serialize([
-                    "text": " ",
-                    "xi_api_key": cfg.elevenApiKey,
-                    "voice_settings": [
-                        "stability": 0.5,
-                        "similarity_boost": 0.8,
-                    ],
-                ]))
-
-                try self.wsSendSync(socket, text: Self.serialize([
-                    "text": text,
-                    "try_trigger_generation": true,
-                ]))
-
-                try self.wsSendSync(socket, text: Self.serialize([
-                    "text": "",
-                    "flush": true,
-                ]))
-
-                var sawFinal = false
-                while !(workItem?.isCancelled ?? true) && !sawFinal {
-                    let message = try self.wsReceiveSync(socket)
-                    let textPayload: String
-                    switch message {
-                    case .string(let payload):
-                        textPayload = payload
-                    case .data(let data):
-                        textPayload = String(data: data, encoding: .utf8) ?? ""
-                    @unknown default:
-                        textPayload = ""
-                    }
-
-                    guard let obj = self.parseJSON(textPayload) else {
-                        continue
-                    }
-
-                    if let audioBase64 = obj["audio"] as? String,
-                       let audioData = Data(base64Encoded: audioBase64)
-                    {
-                        let interleaved = Self.pcm16MonoToStereoFloat(audioData,
-                            sourceSampleRate: Self.sampleRateFromFormat(cfg.elevenTtsOutputFormat),
-                            targetSampleRate: Double(cfg.sampleRateHz))
-                        self.writeTtsAudioToTarget(interleaved)
-                    }
-
-                    if let alignment = obj["alignment"] as? [String: Any] {
-                        let chars = alignment["characters"] as? [String] ?? []
-                        let starts = alignment["character_start_times_seconds"] as? [Double] ?? []
-                        let ends = alignment["character_end_times_seconds"] as? [Double] ?? []
-                        let startsMs = starts.map { Int($0 * 1000.0) }
-                        let endsMs = ends.map { Int($0 * 1000.0) }
-                        self.emitter.emit([
-                            "type": "tts_alignment",
-                            "utterance_id": utteranceID,
-                            "chars": chars,
-                            "char_start_ms": startsMs,
-                            "char_end_ms": endsMs,
-                        ])
-                    }
-
-                    if let isFinal = obj["isFinal"] as? Bool, isFinal {
-                        sawFinal = true
-                    }
-                }
-
-                socket.cancel(with: .normalClosure, reason: nil)
-                self.emitTtsStatus(utteranceID: utteranceID, status: "completed", message: "elevenlabs tts completed")
-            } catch {
-                self.emitTtsStatus(utteranceID: utteranceID, status: "error", message: error.localizedDescription)
-            }
-
-            _ = self.stateQueue.sync {
-                self.elevenTtsWorkItems.removeValue(forKey: utteranceID)
-            }
+        let endpoint = "wss://api.elevenlabs.io/v1/text-to-speech/\(cfg.elevenTtsVoiceID)/stream-input"
+        guard var components = URLComponents(string: endpoint) else {
+            emitTtsStatus(utteranceID: utteranceID, status: "error", message: "invalid elevenlabs tts endpoint")
+            return
         }
+        components.queryItems = [
+            URLQueryItem(name: "model_id", value: cfg.elevenTtsModelID),
+            URLQueryItem(name: "output_format", value: cfg.elevenTtsOutputFormat),
+        ]
+        guard let url = components.url else {
+            emitTtsStatus(utteranceID: utteranceID, status: "error", message: "invalid elevenlabs tts url")
+            return
+        }
+
+        var request = URLRequest(url: url)
+        request.setValue(cfg.elevenApiKey, forHTTPHeaderField: "xi-api-key")
+
+        let socket = URLSession.shared.webSocketTask(with: request)
+        socket.resume()
 
         stateQueue.sync {
-            elevenTtsWorkItems[utteranceID] = workItem
+            elevenTtsSockets[utteranceID] = socket
         }
-        DispatchQueue.global(qos: .userInitiated).async(execute: workItem!)
+
+        // Send BOS (beginning of stream) init message
+        let bos = Self.serialize([
+            "text": " ",
+            "xi_api_key": cfg.elevenApiKey,
+            "voice_settings": [
+                "stability": 0.5,
+                "similarity_boost": 0.8,
+            ],
+        ])
+        socket.send(.string(bos)) { [weak self] error in
+            if let error {
+                self?.emitTtsStatus(utteranceID: utteranceID, status: "error", message: "bos send: \(error.localizedDescription)")
+            }
+        }
+
+        emitTtsStatus(utteranceID: utteranceID, status: "started", message: "elevenlabs tts stream started")
+
+        // Start async receive loop — runs concurrently with text chunk sends
+        elevenLabsTTSReceiveLoop(utteranceID: utteranceID, socket: socket, cfg: cfg)
+    }
+
+    private func elevenLabsTTSReceiveLoop(utteranceID: String, socket: URLSessionWebSocketTask, cfg: EngineConfig) {
+        socket.receive { [weak self] result in
+            guard let self else { return }
+            switch result {
+            case .success(let message):
+                let textPayload: String
+                switch message {
+                case .string(let payload): textPayload = payload
+                case .data(let data): textPayload = String(data: data, encoding: .utf8) ?? ""
+                @unknown default: textPayload = ""
+                }
+
+                guard let obj = self.parseJSON(textPayload) else {
+                    self.elevenLabsTTSReceiveLoop(utteranceID: utteranceID, socket: socket, cfg: cfg)
+                    return
+                }
+
+                if let audioBase64 = obj["audio"] as? String,
+                   let audioData = Data(base64Encoded: audioBase64)
+                {
+                    let interleaved = Self.pcm16MonoToStereoFloat(audioData,
+                        sourceSampleRate: Self.sampleRateFromFormat(cfg.elevenTtsOutputFormat),
+                        targetSampleRate: Double(cfg.sampleRateHz))
+                    self.writeTtsAudioToTarget(interleaved)
+                }
+
+                if let alignment = obj["alignment"] as? [String: Any] {
+                    let chars = alignment["characters"] as? [String] ?? []
+                    let starts = alignment["character_start_times_seconds"] as? [Double] ?? []
+                    let ends = alignment["character_end_times_seconds"] as? [Double] ?? []
+                    let startsMs = starts.map { Int($0 * 1000.0) }
+                    let endsMs = ends.map { Int($0 * 1000.0) }
+                    self.emitter.emit([
+                        "type": "tts_alignment",
+                        "utterance_id": utteranceID,
+                        "chars": chars,
+                        "char_start_ms": startsMs,
+                        "char_end_ms": endsMs,
+                    ])
+                }
+
+                if let isFinal = obj["isFinal"] as? Bool, isFinal {
+                    socket.cancel(with: .normalClosure, reason: nil)
+                    _ = self.stateQueue.sync { self.elevenTtsSockets.removeValue(forKey: utteranceID) }
+                    self.emitTtsStatus(utteranceID: utteranceID, status: "completed", message: "elevenlabs tts completed")
+                    return
+                }
+
+                // Continue receiving
+                self.elevenLabsTTSReceiveLoop(utteranceID: utteranceID, socket: socket, cfg: cfg)
+
+            case .failure(let error):
+                // Socket was cancelled (e.g. tts_cancel) — not an error
+                let wasCancelled = self.stateQueue.sync { self.elevenTtsSockets[utteranceID] == nil }
+                if !wasCancelled {
+                    _ = self.stateQueue.sync { self.elevenTtsSockets.removeValue(forKey: utteranceID) }
+                    self.emitTtsStatus(utteranceID: utteranceID, status: "error", message: error.localizedDescription)
+                }
+            }
+        }
     }
 
     private func startElevenLabsSTT(streamID: String, language: String) {
@@ -965,13 +997,13 @@ private final class EngineCoordinator {
         ttsConverter = nil
         ttsConverterSourceFormat = nil
 
-        let ttsWorkItems = stateQueue.sync { () -> [DispatchWorkItem] in
-            let values = Array(elevenTtsWorkItems.values)
-            elevenTtsWorkItems.removeAll()
+        let ttsSockets = stateQueue.sync { () -> [URLSessionWebSocketTask] in
+            let values = Array(elevenTtsSockets.values)
+            elevenTtsSockets.removeAll()
             return values
         }
 
-        ttsWorkItems.forEach { $0.cancel() }
+        ttsSockets.forEach { $0.cancel(with: .normalClosure, reason: nil) }
 
         stopAppleSTT(streamID: activeSttStreamID ?? "stt-default")
         stopElevenLabsSTT(streamID: activeSttStreamID ?? "stt-default")
