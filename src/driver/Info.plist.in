@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleDevelopmentRegion</key>
+  <string>en</string>
+  <key>CFBundleExecutable</key>
+  <string>VirtualAudioBridge</string>
+  <key>CFBundleIdentifier</key>
+  <string>com.zaphbot.VirtualAudioBridge</string>
+  <key>CFBundleInfoDictionaryVersion</key>
+  <string>6.0</string>
+  <key>CFBundleName</key>
+  <string>VirtualAudioBridge</string>
+  <key>CFBundlePackageType</key>
+  <string>BNDL</string>
+  <key>CFBundleShortVersionString</key>
+  <string>0.1.0</string>
+  <key>CFBundleVersion</key>
+  <string>1</string>
+  <key>CFPlugInDynamicRegistration</key>
+  <false/>
+  <key>CFPlugInFactories</key>
+  <dict>
+    <key>7D6D5023-39F7-4107-A4F5-6B1622673E49</key>
+    <string>VirtualAudioDriverFactory</string>
+  </dict>
+  <key>CFPlugInTypes</key>
+  <dict>
+    <key>443ABAB8-E7B3-491A-B985-BEB9187030DB</key>
+    <array>
+      <string>7D6D5023-39F7-4107-A4F5-6B1622673E49</string>
+    </array>
+  </dict>
+</dict>
+</plist>

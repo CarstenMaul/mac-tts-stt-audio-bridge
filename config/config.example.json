@@ -1,0 +1,32 @@
+{
+  "websocket": {
+    "host": "127.0.0.1",
+    "port": 8765
+  },
+  "session_defaults": {
+    "mode": "apple",
+    "stt_source": "virtual_speaker",
+    "tts_target": "virtual_mic"
+  },
+  "audio": {
+    "sample_rate_hz": 48000,
+    "channels": 2,
+    "ring_capacity_frames": 48000
+  },
+  "elevenlabs": {
+    "api_key_env": "ELEVENLABS_API_KEY",
+    "tts": {
+      "voice_id": "REQUIRED_BY_USER",
+      "model_id": "eleven_flash_v2_5",
+      "output_format": "pcm_48000"
+    },
+    "stt": {
+      "model_id": "scribe_v2_realtime",
+      "language_code": "en"
+    }
+  },
+  "apple": {
+    "locale": "en-US",
+    "on_device_only": true
+  }
+}
