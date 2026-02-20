@@ -238,6 +238,9 @@ private final class EngineCoordinator {
     private var enabled = false
     private var elevenTtsSocket: URLSessionWebSocketTask?
     private var activeUtteranceID: String?
+    private var activeUtteranceBufferedText: String = ""
+    private var activeUtteranceFlushed: Bool = false
+    private var activeSocketReady: Bool = false
 
     private struct PendingUtterance {
         let id: String
@@ -420,6 +423,9 @@ private final class EngineCoordinator {
         let socket = stateQueue.sync { () -> URLSessionWebSocketTask? in
             enabled = false
             activeUtteranceID = nil
+            activeUtteranceBufferedText = ""
+            activeUtteranceFlushed = false
+            activeSocketReady = false
             pendingUtterances.removeAll()
             let s = elevenTtsSocket
             elevenTtsSocket = nil
@@ -451,6 +457,9 @@ private final class EngineCoordinator {
                 }
                 if activeUtteranceID == nil {
                     activeUtteranceID = utteranceID
+                    activeUtteranceBufferedText = ""
+                    activeUtteranceFlushed = false
+                    activeSocketReady = false
                     return true
                 } else {
                     pendingUtterances.append(PendingUtterance(id: utteranceID, text: "", flushed: false))
@@ -483,23 +492,24 @@ private final class EngineCoordinator {
         }
 
         if sessionMode == "elevenlabs" {
-            let (isActive, socket) = stateQueue.sync { () -> (Bool, URLSessionWebSocketTask?) in
+            let action = stateQueue.sync { () -> (shouldSendNow: Bool, shouldBuffer: Bool, socket: URLSessionWebSocketTask?, id: String?) in
                 if activeUtteranceID == utteranceID {
-                    return (true, elevenTtsSocket)
+                    if activeSocketReady, let socket = elevenTtsSocket {
+                        return (true, false, socket, utteranceID)
+                    }
+                    activeUtteranceBufferedText += text
+                    return (false, true, nil, utteranceID)
                 }
                 // Buffer text for queued utterance
                 if let idx = pendingUtterances.firstIndex(where: { $0.id == utteranceID }) {
                     pendingUtterances[idx].text += text
                 }
-                return (false, nil)
+                return (false, false, nil, nil)
             }
-            if isActive, let socket {
-                let msg = Self.serialize(["text": text, "try_trigger_generation": true])
-                socket.send(.string(msg)) { [weak self] error in
-                    if let error {
-                        self?.emitError(code: "eleven_tts_chunk_error", message: error.localizedDescription)
-                    }
-                }
+            if action.shouldSendNow, let ttsSocket = action.socket, let id = action.id {
+                sendElevenLabsChunk(text: text, utteranceID: id, socket: ttsSocket)
+            } else if action.shouldBuffer {
+                // Active utterance not socket-ready yet; chunk is intentionally buffered.
             }
         } else {
             stateQueue.sync {
@@ -516,23 +526,24 @@ private final class EngineCoordinator {
         }
 
         if sessionMode == "elevenlabs" {
-            let (isActive, socket) = stateQueue.sync { () -> (Bool, URLSessionWebSocketTask?) in
+            let action = stateQueue.sync { () -> (shouldSendNow: Bool, shouldBuffer: Bool, socket: URLSessionWebSocketTask?, id: String?) in
                 if activeUtteranceID == utteranceID {
-                    return (true, elevenTtsSocket)
+                    if activeSocketReady, let socket = elevenTtsSocket {
+                        return (true, false, socket, utteranceID)
+                    }
+                    activeUtteranceFlushed = true
+                    return (false, true, nil, utteranceID)
                 }
                 // Mark queued utterance as flushed
                 if let idx = pendingUtterances.firstIndex(where: { $0.id == utteranceID }) {
                     pendingUtterances[idx].flushed = true
                 }
-                return (false, nil)
+                return (false, false, nil, nil)
             }
-            if isActive, let socket {
-                let msg = Self.serialize(["text": "", "flush": true])
-                socket.send(.string(msg)) { [weak self] error in
-                    if let error {
-                        self?.emitError(code: "eleven_tts_flush_error", message: error.localizedDescription)
-                    }
-                }
+            if action.shouldSendNow, let ttsSocket = action.socket, let id = action.id {
+                sendElevenLabsFlush(utteranceID: id, socket: ttsSocket)
+            } else if action.shouldBuffer {
+                // Active utterance flush was requested before socket readiness.
             }
         } else {
             let (text, language) = stateQueue.sync {
@@ -569,6 +580,9 @@ private final class EngineCoordinator {
             if isActive {
                 let socket = stateQueue.sync { () -> URLSessionWebSocketTask? in
                     activeUtteranceID = nil
+                    activeUtteranceBufferedText = ""
+                    activeUtteranceFlushed = false
+                    activeSocketReady = false
                     let s = elevenTtsSocket
                     elevenTtsSocket = nil
                     return s
@@ -841,13 +855,13 @@ private final class EngineCoordinator {
     private func openElevenLabsTTSSocket(text: String? = nil, flush: Bool = false) {
         let cfg = config
         if cfg.elevenApiKey.isEmpty {
-            emitError(code: "missing_api_key", message: "ELEVENLABS_API_KEY missing")
+            failActiveElevenLabsUtterance(code: "missing_api_key", message: "ELEVENLABS_API_KEY missing")
             return
         }
 
         let endpoint = "wss://api.elevenlabs.io/v1/text-to-speech/\(cfg.elevenTtsVoiceID)/stream-input"
         guard var components = URLComponents(string: endpoint) else {
-            emitError(code: "eleven_tts_url", message: "invalid elevenlabs tts endpoint")
+            failActiveElevenLabsUtterance(code: "eleven_tts_url", message: "invalid elevenlabs tts endpoint")
             return
         }
         components.queryItems = [
@@ -855,7 +869,7 @@ private final class EngineCoordinator {
             URLQueryItem(name: "output_format", value: cfg.elevenTtsOutputFormat),
         ]
         guard let url = components.url else {
-            emitError(code: "eleven_tts_url", message: "invalid elevenlabs tts url")
+            failActiveElevenLabsUtterance(code: "eleven_tts_url", message: "invalid elevenlabs tts url")
             return
         }
 
@@ -867,6 +881,13 @@ private final class EngineCoordinator {
 
         stateQueue.sync {
             elevenTtsSocket = socket
+            activeSocketReady = false
+            if let text, !text.isEmpty {
+                activeUtteranceBufferedText += text
+            }
+            if flush {
+                activeUtteranceFlushed = true
+            }
         }
 
         // Send BOS
@@ -879,19 +900,28 @@ private final class EngineCoordinator {
             ],
         ])
         socket.send(.string(bos)) { [weak self] error in
+            guard let self else { return }
             if let error {
-                self?.emitError(code: "eleven_tts_bos_error", message: error.localizedDescription)
+                self.failActiveElevenLabsUtterance(
+                    expectedSocket: socket,
+                    code: "eleven_tts_bos_error",
+                    message: error.localizedDescription
+                )
+                return
             }
-        }
-
-        // Send pre-buffered text + flush for queued utterances
-        if let text, !text.isEmpty {
-            let msg = Self.serialize(["text": text, "try_trigger_generation": true])
-            socket.send(.string(msg)) { _ in }
-        }
-        if flush {
-            let msg = Self.serialize(["text": "", "flush": true])
-            socket.send(.string(msg)) { _ in }
+            let activeID = self.stateQueue.sync { () -> String? in
+                guard self.elevenTtsSocket === socket else { return nil }
+                self.activeSocketReady = true
+                return self.activeUtteranceID
+            }
+            if let activeID {
+                self.emitTtsStatus(
+                    utteranceID: activeID,
+                    status: "socket_ready",
+                    message: "elevenlabs socket ready"
+                )
+                self.drainActiveElevenLabsBufferedMessages(socket: socket, utteranceID: activeID)
+            }
         }
 
         // Start async receive loop
@@ -959,6 +989,9 @@ private final class EngineCoordinator {
                     let uid = self.stateQueue.sync { () -> String? in
                         let uid = self.activeUtteranceID
                         self.activeUtteranceID = nil
+                        self.activeUtteranceBufferedText = ""
+                        self.activeUtteranceFlushed = false
+                        self.activeSocketReady = false
                         self.elevenTtsSocket = nil
                         return uid
                     }
@@ -975,11 +1008,11 @@ private final class EngineCoordinator {
                 // Socket was cancelled (e.g. disable or tts_cancel) — not an error
                 let wasCancelled = self.stateQueue.sync { self.elevenTtsSocket == nil }
                 if !wasCancelled {
-                    let uid = self.stateQueue.sync {
-                        self.elevenTtsSocket = nil
-                        return self.activeUtteranceID
-                    }
-                    self.emitTtsStatus(utteranceID: uid ?? "unknown", status: "error", message: error.localizedDescription)
+                    self.failActiveElevenLabsUtterance(
+                        expectedSocket: socket,
+                        code: "eleven_tts_receive_error",
+                        message: error.localizedDescription
+                    )
                 }
             }
         }
@@ -1126,6 +1159,9 @@ private final class EngineCoordinator {
         let ttsSocket = stateQueue.sync { () -> URLSessionWebSocketTask? in
             enabled = false
             activeUtteranceID = nil
+            activeUtteranceBufferedText = ""
+            activeUtteranceFlushed = false
+            activeSocketReady = false
             pendingUtterances.removeAll()
             let s = elevenTtsSocket
             elevenTtsSocket = nil
@@ -1162,6 +1198,88 @@ private final class EngineCoordinator {
         if let sendError {
             throw sendError
         }
+    }
+
+    private func sendElevenLabsChunk(text: String, utteranceID: String, socket: URLSessionWebSocketTask) {
+        let msg = Self.serialize(["text": text, "try_trigger_generation": true])
+        socket.send(.string(msg)) { [weak self] error in
+            if let error {
+                self?.failActiveElevenLabsUtterance(
+                    expectedUtteranceID: utteranceID,
+                    expectedSocket: socket,
+                    code: "eleven_tts_chunk_error",
+                    message: error.localizedDescription
+                )
+            }
+        }
+    }
+
+    private func sendElevenLabsFlush(utteranceID: String, socket: URLSessionWebSocketTask) {
+        let msg = Self.serialize(["text": "", "flush": true])
+        socket.send(.string(msg)) { [weak self] error in
+            if let error {
+                self?.failActiveElevenLabsUtterance(
+                    expectedUtteranceID: utteranceID,
+                    expectedSocket: socket,
+                    code: "eleven_tts_flush_error",
+                    message: error.localizedDescription
+                )
+            }
+        }
+    }
+
+    private func drainActiveElevenLabsBufferedMessages(socket: URLSessionWebSocketTask, utteranceID: String) {
+        let (text, flush) = stateQueue.sync { () -> (String, Bool) in
+            guard activeUtteranceID == utteranceID, activeSocketReady, elevenTtsSocket === socket else {
+                return ("", false)
+            }
+            let bufferedText = activeUtteranceBufferedText
+            let shouldFlush = activeUtteranceFlushed
+            activeUtteranceBufferedText = ""
+            activeUtteranceFlushed = false
+            return (bufferedText, shouldFlush)
+        }
+
+        if !text.isEmpty {
+            sendElevenLabsChunk(text: text, utteranceID: utteranceID, socket: socket)
+        }
+        if flush {
+            sendElevenLabsFlush(utteranceID: utteranceID, socket: socket)
+        }
+    }
+
+    private func failActiveElevenLabsUtterance(
+        expectedUtteranceID: String? = nil,
+        expectedSocket: URLSessionWebSocketTask? = nil,
+        code: String,
+        message: String
+    ) {
+        let (failedID, socketToCancel) = stateQueue.sync { () -> (String?, URLSessionWebSocketTask?) in
+            guard let currentID = activeUtteranceID else {
+                return (nil, nil)
+            }
+            if let expectedUtteranceID, currentID != expectedUtteranceID {
+                return (nil, nil)
+            }
+            if let expectedSocket, let currentSocket = elevenTtsSocket, currentSocket !== expectedSocket {
+                return (nil, nil)
+            }
+
+            let socket = elevenTtsSocket
+            activeUtteranceID = nil
+            activeUtteranceBufferedText = ""
+            activeUtteranceFlushed = false
+            activeSocketReady = false
+            elevenTtsSocket = nil
+            return (currentID, socket)
+        }
+
+        emitError(code: code, message: message)
+        socketToCancel?.cancel(with: .normalClosure, reason: nil)
+
+        guard let failedID else { return }
+        emitTtsStatus(utteranceID: failedID, status: "error", message: message)
+        drainPendingUtterances()
     }
 
     private func wsReceiveSync(_ socket: URLSessionWebSocketTask, timeout: TimeInterval = 15) throws -> URLSessionWebSocketTask.Message {

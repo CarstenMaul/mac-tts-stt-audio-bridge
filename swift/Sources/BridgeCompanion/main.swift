@@ -154,6 +154,7 @@ final class CompanionViewModel: ObservableObject {
     @Published var sttRunning: Bool = false
     @Published var sessionReady: Bool = false
     @Published var bridgeEnabled: Bool = false
+    @Published var ttsSendInFlight: Bool = false
     @Published var micFeedLevel: Float = 0
     @Published var speakerTapLevel: Float = 0
 
@@ -204,6 +205,7 @@ final class CompanionViewModel: ObservableObject {
         sttRunning = false
         sessionReady = false
         bridgeEnabled = false
+        ttsSendInFlight = false
         status = "Disconnected"
     }
 
@@ -227,13 +229,26 @@ final class CompanionViewModel: ObservableObject {
     func sendText() {
         let trimmed = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
+        guard !ttsSendInFlight else {
+            appendLog("[tts] send ignored: previous command sequence still in flight")
+            return
+        }
 
         let utteranceID = "u-\(Int(Date().timeIntervalSince1970 * 1000))"
-        send(["type": "tts_start", "utterance_id": utteranceID, "language": language])
-        send(["type": "tts_chunk", "utterance_id": utteranceID, "text": trimmed])
-        send(["type": "tts_flush", "utterance_id": utteranceID])
+        ttsSendInFlight = true
+        Task { [weak self] in
+            guard let self else { return }
+            defer { self.ttsSendInFlight = false }
 
-        appendLog("[tts] sent utterance \(utteranceID)")
+            do {
+                try await self.sendAsync(["type": "tts_start", "utterance_id": utteranceID, "language": self.language])
+                try await self.sendAsync(["type": "tts_chunk", "utterance_id": utteranceID, "text": trimmed])
+                try await self.sendAsync(["type": "tts_flush", "utterance_id": utteranceID])
+                self.appendLog("[tts] sent utterance \(utteranceID)")
+            } catch {
+                self.appendLog("[error] tts send failed for \(utteranceID): \(error.localizedDescription)")
+            }
+        }
     }
 
     func startSTT() {
@@ -304,6 +319,27 @@ final class CompanionViewModel: ObservableObject {
                 if let error {
                     self.appendLog("[error] send failed: \(error.localizedDescription)")
                 }
+            }
+        }
+    }
+
+    private func sendAsync(_ object: [String: Any]) async throws {
+        guard let socket,
+              JSONSerialization.isValidJSONObject(object),
+              let data = try? JSONSerialization.data(withJSONObject: object, options: []),
+              let text = String(data: data, encoding: .utf8)
+        else {
+            status = "Not connected"
+            throw NSError(domain: "bridge_companion", code: 1001, userInfo: [NSLocalizedDescriptionKey: "socket unavailable"])
+        }
+
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            socket.send(.string(text)) { error in
+                if let error {
+                    continuation.resume(throwing: error)
+                    return
+                }
+                continuation.resume(returning: ())
             }
         }
     }
@@ -524,7 +560,7 @@ struct ContentView: View {
             // Buttons
             HStack {
                 Button("Send TTS") { viewModel.sendText() }
-                    .disabled(!viewModel.bridgeEnabled)
+                    .disabled(!viewModel.bridgeEnabled || viewModel.ttsSendInFlight)
             }
 
             // STT Transcript
