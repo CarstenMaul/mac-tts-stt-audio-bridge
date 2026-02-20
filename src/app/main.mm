@@ -48,6 +48,14 @@ constexpr const char* kSpeakerTapName = "/virtual_audio_bridge_speaker_tap";
 constexpr const char* kProtocolVersion = "1";
 
 std::atomic<bool> g_should_exit{false};
+bool g_verbose = false;
+
+#define VLOG(msg)          \
+  do {                     \
+    if (g_verbose) {       \
+      std::cerr << "[verbose] " << msg << "\n"; \
+    }                      \
+  } while (0)
 
 void SignalHandler(int /*sig*/) {
   g_should_exit.store(true, std::memory_order_relaxed);
@@ -440,6 +448,9 @@ bool LoadConfig(const std::string& path, BridgeConfig* out_config, std::string* 
     }
 
     *out_config = cfg;
+    VLOG("Config loaded: ws://" << cfg.host << ":" << cfg.port
+         << " mode=" << cfg.session_defaults.mode
+         << " helper=" << cfg.helper_path);
     return true;
   }
 }
@@ -454,6 +465,7 @@ class HelperProcess {
   }
 
   bool Start(const std::string& path, LineCallback callback, std::string* error) {
+    VLOG("HelperProcess::Start path=" << path);
     Stop();
 
     int stdin_pipe[2] = {-1, -1};
@@ -508,6 +520,7 @@ class HelperProcess {
     reader_thread_ = std::thread([this]() { ReaderLoop(); });
     waiter_thread_ = std::thread([this]() { WaiterLoop(); });
 
+    VLOG("Helper process started, pid=" << child_pid_);
     return true;
   }
 
@@ -540,6 +553,7 @@ class HelperProcess {
   }
 
   bool SendLine(const std::string& line, std::string* error) {
+    VLOG("Helper << " << line);
     std::lock_guard<std::mutex> lock(write_mutex_);
     if (!running_.load(std::memory_order_relaxed) || stdin_fd_ < 0) {
       if (error != nullptr) {
@@ -588,6 +602,7 @@ class HelperProcess {
         payload.pop_back();
       }
       if (!payload.empty() && callback_ != nullptr) {
+        VLOG("Helper >> " << payload);
         callback_(payload);
       }
     }
@@ -739,6 +754,7 @@ bool PerformWebSocketHandshake(int fd, std::string* out_extra_bytes, std::string
            << "Sec-WebSocket-Accept: " << accept_value << "\r\n\r\n";
 
   const std::string response_data = response.str();
+  VLOG("WebSocket handshake: sending 101 Switching Protocols");
   if (!SendAll(fd, response_data.data(), response_data.size())) {
     return false;
   }
@@ -922,6 +938,7 @@ class BridgeService {
     }
 
     std::cout << "Bridge service listening on ws://" << config_.host << ":" << config_.port << "\n";
+    VLOG("Entering main event loop");
 
     auto last_heartbeat_sent = std::chrono::steady_clock::now();
     auto last_helper_activity = std::chrono::steady_clock::now();
@@ -1050,6 +1067,7 @@ class BridgeService {
       std::cerr << "Failed to serialize websocket response: " << error << "\n";
       return false;
     }
+    VLOG("Client << " << payload);
     if (!SendWebSocketFrame(active_client_fd_, WsOpcode::kText, payload, &error)) {
       std::cerr << "Failed to send websocket response: " << error << "\n";
       CloseActiveClient();
@@ -1113,6 +1131,7 @@ class BridgeService {
       return;
     }
 
+    VLOG("Client connected, fd=" << fd);
     active_client_fd_ = fd;
     client_pending_bytes_ = std::move(handshake_extra);
     session_configured_ = false;
@@ -1139,6 +1158,7 @@ class BridgeService {
 
   void CloseActiveClient() {
     if (active_client_fd_ >= 0) {
+      VLOG("Closing client fd=" << active_client_fd_);
       std::string ignored;
       (void)SendWebSocketFrame(active_client_fd_, WsOpcode::kClose, "", &ignored);
       close(active_client_fd_);
@@ -1188,6 +1208,7 @@ class BridgeService {
   }
 
   void HandleClientMessage(const std::string& text_payload) {
+    VLOG("Client >> " << text_payload);
     std::string json_error;
     NSDictionary* obj = ParseJsonObject(text_payload, &json_error);
     if (obj == nil) {
@@ -1257,6 +1278,7 @@ class BridgeService {
       session_tts_target_ = tts_target;
       session_configured_ = true;
 
+      VLOG("Session configured: mode=" << mode << " stt_source=" << stt_source << " tts_target=" << tts_target);
       SendSessionConfigToHelper();
 
       NSDictionary* ack = @{
@@ -1286,6 +1308,7 @@ class BridgeService {
       forward[@"language"] = StdStringToNSString(config_.apple.locale);
     }
 
+    VLOG("Forwarding to helper: type=" << type);
     (void)ForwardJsonToHelper(forward);
   }
 
@@ -1354,7 +1377,7 @@ class BridgeService {
 void PrintUsage(const char* program_name) {
   std::cerr
       << "Usage:\n"
-      << "  " << program_name << " service --config <path>\n"
+      << "  " << program_name << " service --config <path> [--verbose]\n"
       << "  " << program_name << " doctor --config <path>\n"
       << "  " << program_name << " debug-tone [--seconds N]\n"
       << "  " << program_name << " debug-loopback [--seconds N]\n";
@@ -1377,6 +1400,15 @@ std::string ParseConfigFlag(int argc, char** argv) {
     }
   }
   return "";
+}
+
+bool ParseVerboseFlag(int argc, char** argv) {
+  for (int i = 2; i < argc; ++i) {
+    if (std::strcmp(argv[i], "--verbose") == 0 || std::strcmp(argv[i], "-v") == 0) {
+      return true;
+    }
+  }
+  return false;
 }
 
 int RunDebugTone(int seconds) {
@@ -1535,6 +1567,11 @@ int main(int argc, char** argv) {
     if (config_path.empty()) {
       std::cerr << "service requires --config <path>\n";
       return 2;
+    }
+
+    g_verbose = ParseVerboseFlag(argc, argv);
+    if (g_verbose) {
+      std::cerr << "[verbose] Verbose logging enabled\n";
     }
 
     BridgeConfig config;

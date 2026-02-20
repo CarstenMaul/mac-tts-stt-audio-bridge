@@ -330,8 +330,12 @@ Boolean DriverHasProperty(AudioServerPlugInDriverRef /*in_driver*/,
         case kAudioObjectPropertyOwner:
         case kAudioObjectPropertyName:
         case kAudioObjectPropertyManufacturer:
+        case kAudioObjectPropertyOwnedObjects:
         case kAudioPlugInPropertyDeviceList:
         case kAudioPlugInPropertyTranslateUIDToDevice:
+        case kAudioPlugInPropertyBoxList:
+        case kAudioPlugInPropertyClockDeviceList:
+        case kAudioPlugInPropertyResourceBundle:
           return true;
         default:
           return false;
@@ -344,6 +348,7 @@ Boolean DriverHasProperty(AudioServerPlugInDriverRef /*in_driver*/,
         case kAudioObjectPropertyName:
         case kAudioObjectPropertyManufacturer:
         case kAudioObjectPropertyOwnedObjects:
+        case kAudioObjectPropertyControlList:
         case kAudioDevicePropertyDeviceUID:
         case kAudioDevicePropertyModelUID:
         case kAudioDevicePropertyTransportType:
@@ -353,13 +358,21 @@ Boolean DriverHasProperty(AudioServerPlugInDriverRef /*in_driver*/,
         case kAudioDevicePropertyAvailableNominalSampleRates:
         case kAudioDevicePropertyBufferFrameSize:
         case kAudioDevicePropertyBufferFrameSizeRange:
-        case kAudioDevicePropertySafetyOffset:
-        case kAudioDevicePropertyLatency:
         case kAudioDevicePropertyZeroTimeStampPeriod:
-        case kAudioDevicePropertyPreferredChannelsForStereo:
         case kAudioDevicePropertyDeviceIsAlive:
         case kAudioDevicePropertyDeviceIsRunning:
+        case kAudioDevicePropertyClockDomain:
+        case kAudioDevicePropertyRelatedDevices:
+        case kAudioDevicePropertyClockIsStable:
+        case kAudioDevicePropertyIsHidden:
           return true;
+        case kAudioDevicePropertySafetyOffset:
+        case kAudioDevicePropertyLatency:
+        case kAudioDevicePropertyPreferredChannelsForStereo:
+        case kAudioDevicePropertyDeviceCanBeDefaultDevice:
+        case kAudioDevicePropertyDeviceCanBeDefaultSystemDevice:
+          return in_address->mScope == kAudioObjectPropertyScopeInput ||
+                 in_address->mScope == kAudioObjectPropertyScopeOutput;
         default:
           return false;
       }
@@ -378,6 +391,7 @@ Boolean DriverHasProperty(AudioServerPlugInDriverRef /*in_driver*/,
         case kAudioStreamPropertyAvailableVirtualFormats:
         case kAudioStreamPropertyPhysicalFormat:
         case kAudioStreamPropertyAvailablePhysicalFormats:
+        case kAudioStreamPropertyIsActive:
           return true;
         default:
           return false;
@@ -437,11 +451,17 @@ OSStatus DriverGetPropertyDataSize(AudioServerPlugInDriverRef /*in_driver*/,
           return kAudioHardwareNoError;
         case kAudioObjectPropertyName:
         case kAudioObjectPropertyManufacturer:
+        case kAudioPlugInPropertyResourceBundle:
           *out_data_size = sizeof(CFStringRef);
           return kAudioHardwareNoError;
+        case kAudioObjectPropertyOwnedObjects:
         case kAudioPlugInPropertyDeviceList:
         case kAudioPlugInPropertyTranslateUIDToDevice:
           *out_data_size = sizeof(AudioObjectID);
+          return kAudioHardwareNoError;
+        case kAudioPlugInPropertyBoxList:
+        case kAudioPlugInPropertyClockDeviceList:
+          *out_data_size = 0;
           return kAudioHardwareNoError;
         default:
           return kAudioHardwareUnknownPropertyError;
@@ -460,7 +480,15 @@ OSStatus DriverGetPropertyDataSize(AudioServerPlugInDriverRef /*in_driver*/,
           *out_data_size = sizeof(CFStringRef);
           return kAudioHardwareNoError;
         case kAudioObjectPropertyOwnedObjects:
-          *out_data_size = sizeof(AudioObjectID) * 2;
+          if (in_address->mScope == kAudioObjectPropertyScopeInput ||
+              in_address->mScope == kAudioObjectPropertyScopeOutput) {
+            *out_data_size = sizeof(AudioObjectID);
+          } else {
+            *out_data_size = sizeof(AudioObjectID) * 2;
+          }
+          return kAudioHardwareNoError;
+        case kAudioObjectPropertyControlList:
+          *out_data_size = 0;
           return kAudioHardwareNoError;
         case kAudioDevicePropertyTransportType:
         case kAudioDevicePropertyBufferFrameSize:
@@ -469,7 +497,15 @@ OSStatus DriverGetPropertyDataSize(AudioServerPlugInDriverRef /*in_driver*/,
         case kAudioDevicePropertyZeroTimeStampPeriod:
         case kAudioDevicePropertyDeviceIsAlive:
         case kAudioDevicePropertyDeviceIsRunning:
+        case kAudioDevicePropertyClockDomain:
+        case kAudioDevicePropertyDeviceCanBeDefaultDevice:
+        case kAudioDevicePropertyDeviceCanBeDefaultSystemDevice:
+        case kAudioDevicePropertyClockIsStable:
+        case kAudioDevicePropertyIsHidden:
           *out_data_size = sizeof(UInt32);
+          return kAudioHardwareNoError;
+        case kAudioDevicePropertyRelatedDevices:
+          *out_data_size = sizeof(AudioObjectID);
           return kAudioHardwareNoError;
         case kAudioDevicePropertyPreferredChannelsForStereo:
           *out_data_size = sizeof(UInt32) * 2;
@@ -505,6 +541,7 @@ OSStatus DriverGetPropertyDataSize(AudioServerPlugInDriverRef /*in_driver*/,
         case kAudioStreamPropertyTerminalType:
         case kAudioStreamPropertyStartingChannel:
         case kAudioStreamPropertyLatency:
+        case kAudioStreamPropertyIsActive:
           *out_data_size = sizeof(UInt32);
           return kAudioHardwareNoError;
         case kAudioObjectPropertyName:
@@ -557,9 +594,11 @@ OSStatus DriverGetPropertyData(AudioServerPlugInDriverRef /*in_driver*/,
         case kAudioObjectPropertyManufacturer:
           return WriteCStringAsCFString(
               in_data_size, out_data_size, out_data, kDriverManufacturer);
-        case kAudioPlugInPropertyDeviceList: {
+        case kAudioObjectPropertyOwnedObjects:
+        case kAudioPlugInPropertyDeviceList:
           return WriteSingleValue(in_data_size, out_data_size, out_data, AudioObjectID{kObjectIDDevice});
-        }
+        case kAudioPlugInPropertyResourceBundle:
+          return WriteCStringAsCFString(in_data_size, out_data_size, out_data, "");
         case kAudioPlugInPropertyTranslateUIDToDevice: {
           if (in_qualifier_data_size < sizeof(CFStringRef) || in_qualifier_data == nullptr) {
             return kAudioHardwareIllegalOperationError;
@@ -576,6 +615,12 @@ OSStatus DriverGetPropertyData(AudioServerPlugInDriverRef /*in_driver*/,
           }
           return WriteSingleValue(in_data_size, out_data_size, out_data, result);
         }
+        case kAudioPlugInPropertyBoxList:
+        case kAudioPlugInPropertyClockDeviceList:
+          if (out_data_size != nullptr) {
+            *out_data_size = 0;
+          }
+          return kAudioHardwareNoError;
         default:
           return kAudioHardwareUnknownPropertyError;
       }
@@ -594,7 +639,16 @@ OSStatus DriverGetPropertyData(AudioServerPlugInDriverRef /*in_driver*/,
           return WriteCStringAsCFString(
               in_data_size, out_data_size, out_data, kDriverManufacturer);
         case kAudioObjectPropertyOwnedObjects: {
-          if (in_data_size < sizeof(AudioObjectID) * 2 || out_data == nullptr) {
+          if (out_data == nullptr) {
+            return kAudioHardwareBadPropertySizeError;
+          }
+          if (in_address->mScope == kAudioObjectPropertyScopeInput) {
+            return WriteSingleValue(in_data_size, out_data_size, out_data, AudioObjectID{kObjectIDStreamInput});
+          }
+          if (in_address->mScope == kAudioObjectPropertyScopeOutput) {
+            return WriteSingleValue(in_data_size, out_data_size, out_data, AudioObjectID{kObjectIDStreamOutput});
+          }
+          if (in_data_size < sizeof(AudioObjectID) * 2) {
             return kAudioHardwareBadPropertySizeError;
           }
           AudioObjectID owned[2] = {kObjectIDStreamInput, kObjectIDStreamOutput};
@@ -604,6 +658,11 @@ OSStatus DriverGetPropertyData(AudioServerPlugInDriverRef /*in_driver*/,
           }
           return kAudioHardwareNoError;
         }
+        case kAudioObjectPropertyControlList:
+          if (out_data_size != nullptr) {
+            *out_data_size = 0;
+          }
+          return kAudioHardwareNoError;
         case kAudioDevicePropertyDeviceUID:
           return WriteCStringAsCFString(in_data_size, out_data_size, out_data, kDeviceUID);
         case kAudioDevicePropertyModelUID:
@@ -690,6 +749,18 @@ OSStatus DriverGetPropertyData(AudioServerPlugInDriverRef /*in_driver*/,
           const UInt32 running = g_io_client_count.load(std::memory_order_relaxed) > 0 ? 1 : 0;
           return WriteSingleValue(in_data_size, out_data_size, out_data, running);
         }
+        case kAudioDevicePropertyClockDomain:
+          return WriteSingleValue(in_data_size, out_data_size, out_data, UInt32{0});
+        case kAudioDevicePropertyDeviceCanBeDefaultDevice:
+          return WriteSingleValue(in_data_size, out_data_size, out_data, UInt32{1});
+        case kAudioDevicePropertyDeviceCanBeDefaultSystemDevice:
+          return WriteSingleValue(in_data_size, out_data_size, out_data, UInt32{1});
+        case kAudioDevicePropertyRelatedDevices:
+          return WriteSingleValue(in_data_size, out_data_size, out_data, AudioObjectID{kObjectIDDevice});
+        case kAudioDevicePropertyClockIsStable:
+          return WriteSingleValue(in_data_size, out_data_size, out_data, UInt32{1});
+        case kAudioDevicePropertyIsHidden:
+          return WriteSingleValue(in_data_size, out_data_size, out_data, UInt32{0});
         default:
           return kAudioHardwareUnknownPropertyError;
       }
@@ -724,6 +795,8 @@ OSStatus DriverGetPropertyData(AudioServerPlugInDriverRef /*in_driver*/,
           return WriteSingleValue(in_data_size, out_data_size, out_data, UInt32{1});
         case kAudioStreamPropertyLatency:
           return WriteSingleValue(in_data_size, out_data_size, out_data, UInt32{0});
+        case kAudioStreamPropertyIsActive:
+          return WriteSingleValue(in_data_size, out_data_size, out_data, UInt32{1});
         case kAudioStreamPropertyVirtualFormat:
         case kAudioStreamPropertyPhysicalFormat: {
           const AudioStreamBasicDescription asbd =
@@ -868,13 +941,20 @@ OSStatus DriverGetZeroTimeStamp(AudioServerPlugInDriverRef /*in_driver*/,
     g_anchor_host_time.store(anchor, std::memory_order_relaxed);
   }
 
-  const Float64 elapsed_seconds =
-      static_cast<Float64>(now_host - anchor) / AudioGetHostClockFrequency();
-  const Float64 sample_time = g_anchor_sample_time.load(std::memory_order_relaxed) +
-                              (elapsed_seconds * g_sample_rate.load(std::memory_order_relaxed));
+  const Float64 host_freq = AudioGetHostClockFrequency();
+  const Float64 sample_rate = g_sample_rate.load(std::memory_order_relaxed);
+  const UInt32 buffer_frames = g_buffer_frame_size.load(std::memory_order_relaxed);
 
-  *out_sample_time = sample_time;
-  *out_host_time = now_host;
+  const Float64 elapsed_seconds = static_cast<Float64>(now_host - anchor) / host_freq;
+  const Float64 elapsed_samples = elapsed_seconds * sample_rate;
+
+  const UInt64 num_periods = static_cast<UInt64>(elapsed_samples) / buffer_frames;
+  const Float64 quantized_sample_time = static_cast<Float64>(num_periods * buffer_frames);
+  const Float64 quantized_host_seconds = quantized_sample_time / sample_rate;
+  const UInt64 quantized_host_time = anchor + static_cast<UInt64>(quantized_host_seconds * host_freq);
+
+  *out_sample_time = quantized_sample_time;
+  *out_host_time = quantized_host_time;
   *out_seed = g_clock_seed.load(std::memory_order_relaxed);
   return kAudioHardwareNoError;
 }

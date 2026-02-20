@@ -53,10 +53,13 @@ private final class SharedMemoryAudioRing {
         let backingFile = "/tmp/\(pathName).ring"
 
         let flags = create ? (O_CREAT | O_RDWR) : O_RDWR
-        let opened = Darwin.open(backingFile, flags, S_IRUSR | S_IWUSR)
+        let opened = Darwin.open(backingFile, flags, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH)
         guard opened >= 0 else {
             return false
         }
+        // Force permissions regardless of umask so both the driver (_coreaudiod)
+        // and user-space helper can read and write the ring.
+        fchmod(opened, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH)
 
         let mapSize = Self.headerBytes + Int(channels) * Int(capacityFrames) * MemoryLayout<Float>.size
         if ftruncate(opened, off_t(mapSize)) != 0 {
@@ -232,22 +235,31 @@ private final class EngineCoordinator {
     private var activeSttStreamID: String?
 
     private var elevenTtsWorkItems: [String: DispatchWorkItem] = [:]
+    private var activeSynthesizer: AVSpeechSynthesizer?
 
     private var shouldExit = false
 
     func run() {
-        while let line = readLine() {
-            guard let object = parseJSON(line) else {
-                emitError(code: "invalid_json", message: "Failed to parse helper command")
-                continue
+        // Read stdin on a background thread so the main RunLoop stays free
+        // for AVSpeechSynthesizer and other framework callbacks.
+        DispatchQueue.global(qos: .userInitiated).async { [self] in
+            while let line = readLine() {
+                guard let object = parseJSON(line) else {
+                    emitError(code: "invalid_json", message: "Failed to parse helper command")
+                    continue
+                }
+                handle(command: object)
+                if shouldExit {
+                    break
+                }
             }
-            handle(command: object)
-            if shouldExit {
-                break
-            }
+
+            shutdown()
+            CFRunLoopStop(CFRunLoopGetMain())
         }
 
-        shutdown()
+        // Run the main RunLoop so AVSpeechSynthesizer callbacks are delivered.
+        RunLoop.main.run()
     }
 
     private func parseJSON(_ text: String) -> [String: Any]? {
@@ -494,6 +506,7 @@ private final class EngineCoordinator {
         emitTtsStatus(utteranceID: utteranceID, status: "started", message: "apple tts started")
 
         let synthesizer = AVSpeechSynthesizer()
+        activeSynthesizer = synthesizer
         let utterance = AVSpeechUtterance(string: text)
         utterance.voice = AVSpeechSynthesisVoice(language: config.appleLocale)
 
@@ -502,6 +515,7 @@ private final class EngineCoordinator {
 
             guard let pcm = buffer as? AVAudioPCMBuffer else { return }
             if pcm.frameLength == 0 {
+                self.activeSynthesizer = nil
                 self.emitTtsStatus(utteranceID: utteranceID, status: "completed", message: "apple tts completed")
                 return
             }

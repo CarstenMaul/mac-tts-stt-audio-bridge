@@ -5,6 +5,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 namespace bridge {
@@ -79,10 +80,13 @@ bool SharedMemoryAudioRing::Open(const std::string& name,
   const std::string backing_file = "/tmp/" + path_name + ".ring";
 
   const int flags = create ? (O_CREAT | O_RDWR) : O_RDWR;
-  shm_fd_ = open(backing_file.c_str(), flags, 0600);
+  shm_fd_ = open(backing_file.c_str(), flags, 0666);
   if (shm_fd_ < 0) {
     return false;
   }
+  // Force permissions regardless of umask so both the driver (_coreaudiod)
+  // and user-space helper can read and write the ring.
+  (void)fchmod(shm_fd_, 0666);
 
   mapping_size_ = MappingSize(channels, capacity_frames);
   if (ftruncate(shm_fd_, static_cast<off_t>(mapping_size_)) != 0) {
