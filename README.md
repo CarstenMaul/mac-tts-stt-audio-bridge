@@ -76,6 +76,35 @@ If you see `Signature=adhoc` and/or `TeamIdentifier=not set`, sign with an Apple
 ALLOW_UNSIGNED_DRIVER=1 ./scripts/install_driver.sh build/VirtualAudioBridge.driver
 ```
 
+### Code signing setup
+
+Recommended certificate types:
+
+- local-only testing on your own Mac: `Mac Development` (may work, not for distribution)
+- broader install reliability/distribution: `Developer ID Application`
+
+Install the certificate and private key into your user `login` keychain, then verify identities:
+
+```bash
+security find-identity -v -p codesigning ~/Library/Keychains/login.keychain-db
+```
+
+Sign the built driver bundle (replace identity string):
+
+```bash
+codesign --force --deep --timestamp --options runtime \
+  --sign "Developer ID Application: Your Name (TEAMID)" \
+  build/VirtualAudioBridge.driver
+```
+
+Verify the resulting signature:
+
+```bash
+codesign -dv --verbose=4 build/VirtualAudioBridge.driver/Contents/MacOS/VirtualAudioBridge 2>&1 | rg 'Signature=|Authority=|TeamIdentifier='
+```
+
+Expected: not `Signature=adhoc`, and `TeamIdentifier` is set.
+
 ## Configuration
 
 The service requires `--config <path>`. The recommended location is:
