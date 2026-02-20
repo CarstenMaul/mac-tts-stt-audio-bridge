@@ -121,6 +121,7 @@ final class CompanionViewModel: ObservableObject {
     @Published var logText: String = ""
     @Published var transcriptText: String = ""
     @Published var sttRunning: Bool = false
+    @Published var sessionReady: Bool = false
     @Published var micFeedLevel: Float = 0
     @Published var speakerTapLevel: Float = 0
 
@@ -169,6 +170,7 @@ final class CompanionViewModel: ObservableObject {
         }
 
         sttRunning = false
+        sessionReady = false
         status = "Disconnected"
     }
 
@@ -201,6 +203,7 @@ final class CompanionViewModel: ObservableObject {
     }
 
     func applySessionConfig() {
+        sessionReady = false
         send([
             "type": "configure_session",
             "mode": mode.rawValue,
@@ -277,6 +280,7 @@ final class CompanionViewModel: ObservableObject {
                 appendLog("[error] receive failed: \(error.localizedDescription)")
                 status = "Disconnected"
                 sttRunning = false
+                sessionReady = false
                 break
             }
         }
@@ -299,6 +303,7 @@ final class CompanionViewModel: ObservableObject {
             applySessionConfig()
         case "session_config_applied":
             let mode = (dict["mode"] as? String) ?? "unknown"
+            sessionReady = true
             appendLog("[info] session mode applied: \(mode)")
         case "tts_status":
             let id = (dict["utterance_id"] as? String) ?? "?"
@@ -413,8 +418,15 @@ struct ContentView: View {
                 Button("Apply Mode") { viewModel.applySessionConfig() }
             }
 
-            Text("Status: \(viewModel.status)")
-                .font(.caption)
+            HStack(spacing: 6) {
+                Text("Status: \(viewModel.status)")
+                    .font(.caption)
+                if viewModel.sessionReady {
+                    Text("Engine Ready")
+                        .font(.caption)
+                        .foregroundColor(.green)
+                }
+            }
 
             // Audio levels
             VStack(spacing: 4) {
@@ -434,6 +446,7 @@ struct ContentView: View {
             // Buttons
             HStack {
                 Button("Send TTS") { viewModel.sendText() }
+                    .disabled(!viewModel.sessionReady)
                 Spacer().frame(width: 20)
                 Button(viewModel.sttRunning ? "Stop STT" : "Start STT") {
                     if viewModel.sttRunning {
@@ -442,6 +455,7 @@ struct ContentView: View {
                         viewModel.startSTT()
                     }
                 }
+                .disabled(!viewModel.sessionReady && !viewModel.sttRunning)
                 .foregroundColor(viewModel.sttRunning ? .red : .primary)
                 if viewModel.sttRunning {
                     Text("STT active")

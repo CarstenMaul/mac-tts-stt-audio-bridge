@@ -1280,12 +1280,8 @@ class BridgeService {
 
       VLOG("Session configured: mode=" << mode << " stt_source=" << stt_source << " tts_target=" << tts_target);
       SendSessionConfigToHelper();
-
-      NSDictionary* ack = @{
-        @"type" : @"session_config_applied",
-        @"mode" : StdStringToNSString(mode),
-      };
-      (void)SendJsonToClient(ack);
+      // The helper emits session_config_applied after warm-up; it flows
+      // through FlushHelperEvents() automatically.
       return;
     }
 

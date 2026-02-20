@@ -45,13 +45,11 @@ set(SWIFT_PACKAGE_DIR "${CMAKE_SOURCE_DIR}/swift")
 set(SWIFT_BUILD_DIR "${SWIFT_PACKAGE_DIR}/.build/release")
 set(ENGINE_HELPER_OUTPUT "${CMAKE_BINARY_DIR}/engine_helper")
 
-add_custom_command(
-  OUTPUT "${ENGINE_HELPER_OUTPUT}"
+add_custom_target(engine_helper_build
   COMMAND env SWIFT_BUILD_DISABLE_SANDBOX=1 CLANG_MODULE_CACHE_PATH=/tmp/stt_tts_bridge_clang_module_cache swift build --package-path "${SWIFT_PACKAGE_DIR}" --product engine_helper -c release
   COMMAND ${CMAKE_COMMAND} -E copy "${SWIFT_BUILD_DIR}/engine_helper" "${ENGINE_HELPER_OUTPUT}"
   COMMENT "Building Swift engine_helper"
 )
-add_custom_target(engine_helper_build DEPENDS "${ENGINE_HELPER_OUTPUT}")
 add_dependencies(virtual_audio_bridge engine_helper_build)
 
 add_custom_target(bridge_companion_build

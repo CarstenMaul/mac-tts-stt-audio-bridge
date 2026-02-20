@@ -236,6 +236,8 @@ private final class EngineCoordinator {
 
     private var elevenTtsWorkItems: [String: DispatchWorkItem] = [:]
     private var activeSynthesizer: AVSpeechSynthesizer?
+    private var warmSynthesizer: AVSpeechSynthesizer?
+    private var warmVoice: AVSpeechSynthesisVoice?
     private var ttsConverter: AVAudioConverter?
     private var ttsConverterSourceFormat: AVAudioFormat?
 
@@ -372,6 +374,27 @@ private final class EngineCoordinator {
         }
         if let target = command["tts_target"] as? String {
             sessionTtsTarget = target
+        }
+
+        if sessionMode == "apple" {
+            warmUpAppleFrameworks()
+        }
+
+        emitter.emit(["type": "session_config_applied", "mode": sessionMode])
+    }
+
+    private func warmUpAppleFrameworks() {
+        // Pre-create synthesizer and voice so first TTS call has no startup delay.
+        warmSynthesizer = AVSpeechSynthesizer()
+        warmVoice = AVSpeechSynthesisVoice(language: config.appleLocale)
+
+        // Fire-and-forget speech recognition authorization (non-blocking).
+        // The existing semaphore fallback in startAppleSTT() handles the case
+        // where this hasn't completed yet.
+        if !appleSpeechAuthorized {
+            SFSpeechRecognizer.requestAuthorization { [weak self] status in
+                self?.appleSpeechAuthorized = (status == .authorized)
+            }
         }
     }
 
@@ -554,10 +577,18 @@ private final class EngineCoordinator {
     private func runAppleTTS(utteranceID: String, text: String) {
         emitTtsStatus(utteranceID: utteranceID, status: "started", message: "apple tts started")
 
-        let synthesizer = AVSpeechSynthesizer()
+        let synthesizer: AVSpeechSynthesizer
+        if let warm = warmSynthesizer {
+            synthesizer = warm
+            warmSynthesizer = nil
+        } else {
+            synthesizer = AVSpeechSynthesizer()
+        }
         activeSynthesizer = synthesizer
+
         let utterance = AVSpeechUtterance(string: text)
-        utterance.voice = AVSpeechSynthesisVoice(language: config.appleLocale)
+        utterance.voice = warmVoice ?? AVSpeechSynthesisVoice(language: config.appleLocale)
+        warmVoice = nil
 
         synthesizer.write(utterance) { [weak self] buffer in
             guard let self else { return }
@@ -565,6 +596,9 @@ private final class EngineCoordinator {
             guard let pcm = buffer as? AVAudioPCMBuffer else { return }
             if pcm.frameLength == 0 {
                 self.activeSynthesizer = nil
+                // Pre-create synthesizer for the next call.
+                self.warmSynthesizer = AVSpeechSynthesizer()
+                self.warmVoice = AVSpeechSynthesisVoice(language: self.config.appleLocale)
                 self.emitTtsStatus(utteranceID: utteranceID, status: "completed", message: "apple tts completed")
                 return
             }
