@@ -111,7 +111,7 @@ private final class SharedMemoryAudioRing {
         capacityFrames = 0
     }
 
-    func write(interleavedFrames: [Float], frameCount: Int) -> Int {
+    func write(interleavedFrames: [Float], sampleOffset: Int = 0, frameCount: Int) -> Int {
         lock.lock()
         defer { lock.unlock() }
 
@@ -133,7 +133,7 @@ private final class SharedMemoryAudioRing {
 
         for frame in 0 ..< Int(writable) {
             let dstFrame = Int((writeIndex &+ UInt32(frame)) % capacityFrames)
-            let srcOffset = frame * totalChannels
+            let srcOffset = sampleOffset + frame * totalChannels
             let dstOffset = dstFrame * totalChannels
             for ch in 0 ..< totalChannels {
                 dataPtr[dstOffset + ch] = interleavedFrames[srcOffset + ch]
@@ -236,6 +236,13 @@ private final class EngineCoordinator {
 
     private var elevenTtsWorkItems: [String: DispatchWorkItem] = [:]
     private var activeSynthesizer: AVSpeechSynthesizer?
+    private var ttsConverter: AVAudioConverter?
+    private var ttsConverterSourceFormat: AVAudioFormat?
+
+    private var ttsPendingSamples: [Float] = []
+    private var ttsPendingOffset: Int = 0
+    private let ttsPendingLock = NSLock()
+    private var ttsDrainTimer: DispatchSourceTimer?
 
     private var shouldExit = false
 
@@ -485,16 +492,58 @@ private final class EngineCoordinator {
 
     private func writeTtsAudioToTarget(_ interleavedStereo: [Float]) {
         guard !interleavedStereo.isEmpty else { return }
-        let frames = interleavedStereo.count / max(config.channels, 1)
 
+        ttsPendingLock.lock()
+        ttsPendingSamples.append(contentsOf: interleavedStereo)
+        if ttsDrainTimer == nil {
+            let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .userInteractive))
+            timer.schedule(deadline: .now(), repeating: .milliseconds(5))
+            timer.setEventHandler { [weak self] in
+                self?.drainPendingSamples()
+            }
+            ttsDrainTimer = timer
+            timer.resume()
+        }
+        ttsPendingLock.unlock()
+    }
+
+    private func drainPendingSamples() {
+        ttsPendingLock.lock()
+        defer { ttsPendingLock.unlock() }
+
+        let remaining = ttsPendingSamples.count - ttsPendingOffset
+        guard remaining > 0 else {
+            ttsPendingSamples.removeAll(keepingCapacity: true)
+            ttsPendingOffset = 0
+            ttsDrainTimer?.cancel()
+            ttsDrainTimer = nil
+            return
+        }
+
+        let channels = max(config.channels, 1)
+        let frameCount = remaining / channels
+        guard frameCount > 0 else { return }
+
+        let written: Int
         switch sessionTtsTarget {
         case "virtual_speaker":
-            _ = speakerRing.write(interleavedFrames: interleavedStereo, frameCount: frames)
+            written = speakerRing.write(interleavedFrames: ttsPendingSamples, sampleOffset: ttsPendingOffset, frameCount: frameCount)
         case "both":
-            _ = micRing.write(interleavedFrames: interleavedStereo, frameCount: frames)
-            _ = speakerRing.write(interleavedFrames: interleavedStereo, frameCount: frames)
+            let w1 = micRing.write(interleavedFrames: ttsPendingSamples, sampleOffset: ttsPendingOffset, frameCount: frameCount)
+            let w2 = speakerRing.write(interleavedFrames: ttsPendingSamples, sampleOffset: ttsPendingOffset, frameCount: frameCount)
+            written = min(w1, w2)
         default:
-            _ = micRing.write(interleavedFrames: interleavedStereo, frameCount: frames)
+            written = micRing.write(interleavedFrames: ttsPendingSamples, sampleOffset: ttsPendingOffset, frameCount: frameCount)
+        }
+
+        if written > 0 {
+            ttsPendingOffset += written * channels
+        }
+
+        // Compact when more than half consumed
+        if ttsPendingOffset > ttsPendingSamples.count / 2 && ttsPendingOffset > 0 {
+            ttsPendingSamples.removeFirst(ttsPendingOffset)
+            ttsPendingOffset = 0
         }
     }
 
@@ -520,7 +569,7 @@ private final class EngineCoordinator {
                 return
             }
 
-            let converted = Self.convertBufferToBridgeFormat(buffer: pcm)
+            let converted = self.convertBufferToBridgeFormat(buffer: pcm)
             self.writeTtsAudioToTarget(converted)
         }
     }
@@ -859,6 +908,15 @@ private final class EngineCoordinator {
     }
 
     private func shutdown() {
+        ttsPendingLock.lock()
+        ttsDrainTimer?.cancel()
+        ttsDrainTimer = nil
+        ttsPendingSamples.removeAll()
+        ttsPendingOffset = 0
+        ttsPendingLock.unlock()
+        ttsConverter = nil
+        ttsConverterSourceFormat = nil
+
         let ttsWorkItems = stateQueue.sync { () -> [DispatchWorkItem] in
             let values = Array(elevenTtsWorkItems.values)
             elevenTtsWorkItems.removeAll()
@@ -919,19 +977,25 @@ private final class EngineCoordinator {
         }
     }
 
-    private static func convertBufferToBridgeFormat(buffer: AVAudioPCMBuffer) -> [Float] {
+    private func convertBufferToBridgeFormat(buffer: AVAudioPCMBuffer) -> [Float] {
         let targetFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 48_000, channels: 2, interleaved: true)!
 
         if buffer.format == targetFormat {
-            return readInterleaved(buffer: buffer)
+            return Self.readInterleaved(buffer: buffer)
         }
 
-        guard let converter = AVAudioConverter(from: buffer.format, to: targetFormat) else {
+        // Cache the converter so resampler state is preserved across callbacks,
+        // eliminating clicks at chunk boundaries.
+        if ttsConverter == nil || ttsConverterSourceFormat != buffer.format {
+            ttsConverter = AVAudioConverter(from: buffer.format, to: targetFormat)
+            ttsConverterSourceFormat = buffer.format
+        }
+        guard let converter = ttsConverter else {
             return []
         }
 
         let ratio = targetFormat.sampleRate / buffer.format.sampleRate
-        let outCapacity = AVAudioFrameCount(max(1, Int(Double(buffer.frameLength) * ratio) + 8))
+        let outCapacity = AVAudioFrameCount(max(1, Int(Double(buffer.frameLength) * ratio) + 64))
         guard let outBuffer = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: outCapacity) else {
             return []
         }
@@ -953,7 +1017,7 @@ private final class EngineCoordinator {
             return []
         }
 
-        return readInterleaved(buffer: outBuffer)
+        return Self.readInterleaved(buffer: outBuffer)
     }
 
     private static func readInterleaved(buffer: AVAudioPCMBuffer) -> [Float] {
