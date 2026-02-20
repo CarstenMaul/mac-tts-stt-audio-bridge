@@ -20,7 +20,7 @@ constexpr UInt32 kChannelCount = 2;
 constexpr Float64 kDefaultSampleRate = 48000.0;
 constexpr UInt32 kDefaultBufferFrameSize = 480;
 
-constexpr const char* kDriverName = "Virtual Audio Bridge";
+constexpr const char* kDriverName = "VirtualAudioBridge";
 constexpr const char* kDriverManufacturer = "stt-tts-audio-bridge";
 constexpr const char* kDeviceUID = "com.zaphbot.VirtualAudioBridge.Device";
 constexpr const char* kModelUID = "com.zaphbot.VirtualAudioBridge.Model";
