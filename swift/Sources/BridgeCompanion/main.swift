@@ -113,9 +113,40 @@ final class CompanionViewModel: ObservableObject {
         var id: String { rawValue }
     }
 
+    struct Language: Identifiable, Hashable {
+        let code: String
+        let label: String
+        var id: String { code }
+    }
+
+    static let languages: [Language] = [
+        Language(code: "en-US", label: "English (US)"),
+        Language(code: "en-GB", label: "English (UK)"),
+        Language(code: "de-DE", label: "German"),
+        Language(code: "fr-FR", label: "French"),
+        Language(code: "es-ES", label: "Spanish"),
+        Language(code: "it-IT", label: "Italian"),
+        Language(code: "pt-BR", label: "Portuguese (BR)"),
+        Language(code: "nl-NL", label: "Dutch"),
+        Language(code: "ja-JP", label: "Japanese"),
+        Language(code: "ko-KR", label: "Korean"),
+        Language(code: "zh-CN", label: "Chinese (Simplified)"),
+        Language(code: "zh-TW", label: "Chinese (Traditional)"),
+        Language(code: "ru-RU", label: "Russian"),
+        Language(code: "pl-PL", label: "Polish"),
+        Language(code: "sv-SE", label: "Swedish"),
+        Language(code: "da-DK", label: "Danish"),
+        Language(code: "nb-NO", label: "Norwegian"),
+        Language(code: "fi-FI", label: "Finnish"),
+        Language(code: "tr-TR", label: "Turkish"),
+        Language(code: "ar-SA", label: "Arabic"),
+        Language(code: "hi-IN", label: "Hindi"),
+    ]
+
     @Published var host: String = "127.0.0.1"
     @Published var port: String = "8765"
     @Published var mode: EngineMode = .apple
+    @Published var language: String = "en-US"
     @Published var status: String = "Disconnected"
     @Published var inputText: String = ""
     @Published var logText: String = ""
@@ -179,7 +210,7 @@ final class CompanionViewModel: ObservableObject {
         guard !trimmed.isEmpty else { return }
 
         let utteranceID = "u-\(Int(Date().timeIntervalSince1970 * 1000))"
-        send(["type": "tts_start", "utterance_id": utteranceID])
+        send(["type": "tts_start", "utterance_id": utteranceID, "language": language])
         send(["type": "tts_chunk", "utterance_id": utteranceID, "text": trimmed])
         send(["type": "tts_flush", "utterance_id": utteranceID])
 
@@ -192,7 +223,7 @@ final class CompanionViewModel: ObservableObject {
         transcriptText = ""
         sttRunning = true
 
-        send(["type": "start_stt", "stream_id": "s1", "language": "en-US"])
+        send(["type": "start_stt", "stream_id": "s1", "language": language])
         appendLog("[stt] start requested")
     }
 
@@ -412,6 +443,13 @@ struct ContentView: View {
                 }
                 .pickerStyle(.segmented)
                 .frame(width: 220)
+
+                Picker("Language", selection: $viewModel.language) {
+                    ForEach(CompanionViewModel.languages) { lang in
+                        Text(lang.label).tag(lang.code)
+                    }
+                }
+                .frame(width: 180)
 
                 Button("Connect") { viewModel.connect() }
                 Button("Disconnect") { viewModel.disconnect() }

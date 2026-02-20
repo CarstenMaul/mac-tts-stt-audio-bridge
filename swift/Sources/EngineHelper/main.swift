@@ -222,6 +222,7 @@ private final class EngineCoordinator {
     private var speakerRing = SharedMemoryAudioRing()
 
     private var utteranceBuffers: [String: String] = [:]
+    private var utteranceLanguages: [String: String] = [:]
 
     private var appleRecognizer: SFSpeechRecognizer?
     private var appleRecognitionTask: SFSpeechRecognitionTask?
@@ -237,7 +238,6 @@ private final class EngineCoordinator {
     private var elevenTtsWorkItems: [String: DispatchWorkItem] = [:]
     private var activeSynthesizer: AVSpeechSynthesizer?
     private var warmSynthesizer: AVSpeechSynthesizer?
-    private var warmVoice: AVSpeechSynthesisVoice?
     private var ttsConverter: AVAudioConverter?
     private var ttsConverterSourceFormat: AVAudioFormat?
 
@@ -384,9 +384,9 @@ private final class EngineCoordinator {
     }
 
     private func warmUpAppleFrameworks() {
-        // Pre-create synthesizer and voice so first TTS call has no startup delay.
+        // Pre-create synthesizer so first TTS call has no startup delay.
+        // Voice is resolved per-utterance now that language is dynamic.
         warmSynthesizer = AVSpeechSynthesizer()
-        warmVoice = AVSpeechSynthesisVoice(language: config.appleLocale)
 
         // Fire-and-forget speech recognition authorization (non-blocking).
         // The existing semaphore fallback in startAppleSTT() handles the case
@@ -403,8 +403,12 @@ private final class EngineCoordinator {
             emitError(code: "missing_utterance_id", message: "tts_start requires utterance_id")
             return
         }
+        let language = command["language"] as? String
         stateQueue.sync {
             utteranceBuffers[utteranceID] = ""
+            if let language, !language.isEmpty {
+                utteranceLanguages[utteranceID] = language
+            }
         }
         emitTtsStatus(utteranceID: utteranceID, status: "queued", message: "queued")
     }
@@ -429,8 +433,10 @@ private final class EngineCoordinator {
             return
         }
 
-        let text = stateQueue.sync {
-            utteranceBuffers.removeValue(forKey: utteranceID) ?? ""
+        let (text, language) = stateQueue.sync {
+            let t = utteranceBuffers.removeValue(forKey: utteranceID) ?? ""
+            let l = utteranceLanguages.removeValue(forKey: utteranceID)
+            return (t, l)
         }
 
         if text.isEmpty {
@@ -441,7 +447,7 @@ private final class EngineCoordinator {
         if sessionMode == "elevenlabs" {
             runElevenLabsTTS(utteranceID: utteranceID, text: text)
         } else {
-            runAppleTTS(utteranceID: utteranceID, text: text)
+            runAppleTTS(utteranceID: utteranceID, text: text, language: language)
         }
     }
 
@@ -452,6 +458,7 @@ private final class EngineCoordinator {
 
         let workItem = stateQueue.sync { () -> DispatchWorkItem? in
             utteranceBuffers.removeValue(forKey: utteranceID)
+            utteranceLanguages.removeValue(forKey: utteranceID)
             return elevenTtsWorkItems.removeValue(forKey: utteranceID)
         }
 
@@ -574,7 +581,7 @@ private final class EngineCoordinator {
         return sessionSttSource == "virtual_mic" ? micRing : speakerRing
     }
 
-    private func runAppleTTS(utteranceID: String, text: String) {
+    private func runAppleTTS(utteranceID: String, text: String, language: String? = nil) {
         emitTtsStatus(utteranceID: utteranceID, status: "started", message: "apple tts started")
 
         let synthesizer: AVSpeechSynthesizer
@@ -586,9 +593,9 @@ private final class EngineCoordinator {
         }
         activeSynthesizer = synthesizer
 
+        let voiceLanguage = (language != nil && !language!.isEmpty) ? language! : config.appleLocale
         let utterance = AVSpeechUtterance(string: text)
-        utterance.voice = warmVoice ?? AVSpeechSynthesisVoice(language: config.appleLocale)
-        warmVoice = nil
+        utterance.voice = AVSpeechSynthesisVoice(language: voiceLanguage)
 
         synthesizer.write(utterance) { [weak self] buffer in
             guard let self else { return }
@@ -598,7 +605,6 @@ private final class EngineCoordinator {
                 self.activeSynthesizer = nil
                 // Pre-create synthesizer for the next call.
                 self.warmSynthesizer = AVSpeechSynthesizer()
-                self.warmVoice = AVSpeechSynthesisVoice(language: self.config.appleLocale)
                 self.emitTtsStatus(utteranceID: utteranceID, status: "completed", message: "apple tts completed")
                 return
             }
