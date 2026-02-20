@@ -227,7 +227,7 @@ struct AudioConfig {
 struct ElevenLabsTtsConfig {
   std::string voice_id;
   std::string model_id = "eleven_flash_v2_5";
-  std::string output_format = "pcm_48000";
+  std::string output_format = "pcm_24000";
 };
 
 struct ElevenLabsSttConfig {

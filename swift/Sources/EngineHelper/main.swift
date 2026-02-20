@@ -198,7 +198,7 @@ private struct EngineConfig {
     var elevenApiKey: String = ""
     var elevenTtsVoiceID: String = ""
     var elevenTtsModelID: String = "eleven_flash_v2_5"
-    var elevenTtsOutputFormat: String = "pcm_48000"
+    var elevenTtsOutputFormat: String = "pcm_24000"
     var elevenSttModelID: String = "scribe_v2_realtime"
     var elevenSttLanguageCode: String = "en"
 
@@ -784,7 +784,9 @@ private final class EngineCoordinator {
                     if let audioBase64 = obj["audio"] as? String,
                        let audioData = Data(base64Encoded: audioBase64)
                     {
-                        let interleaved = Self.pcm16MonoToStereoFloat(audioData)
+                        let interleaved = Self.pcm16MonoToStereoFloat(audioData,
+                            sourceSampleRate: Self.sampleRateFromFormat(cfg.elevenTtsOutputFormat),
+                            targetSampleRate: Double(cfg.sampleRateHz))
                         self.writeTtsAudioToTarget(interleaved)
                     }
 
@@ -838,9 +840,13 @@ private final class EngineCoordinator {
             return
         }
 
+        // ElevenLabs STT expects ISO 639-1 language codes (e.g. "en"), not BCP 47 (e.g. "en-US").
+        let rawLang = language.isEmpty ? config.elevenSttLanguageCode : language
+        let sttLang = rawLang.contains("-") ? String(rawLang.prefix(while: { $0 != "-" })) : rawLang
+
         components.queryItems = [
             URLQueryItem(name: "model_id", value: config.elevenSttModelID),
-            URLQueryItem(name: "language_code", value: language.isEmpty ? config.elevenSttLanguageCode : language),
+            URLQueryItem(name: "language_code", value: sttLang),
         ]
 
         guard let url = components.url else {
@@ -898,7 +904,9 @@ private final class EngineCoordinator {
 
                     let pcmData = Self.floatMonoToPCM16(mono16k)
                     let payload = Self.serialize([
+                        "message_type": "input_audio_chunk",
                         "audio_base_64": pcmData.base64EncodedString(),
+                        "sample_rate": 16000,
                     ])
                     try self.wsSendSync(socket, text: payload)
                 }
@@ -1121,20 +1129,56 @@ private final class EngineCoordinator {
         return data
     }
 
-    private static func pcm16MonoToStereoFloat(_ data: Data) -> [Float] {
+    private static func sampleRateFromFormat(_ format: String) -> Double {
+        // Formats like "pcm_24000", "pcm_44100", "pcm_16000"
+        if let underscore = format.lastIndex(of: "_"),
+           let rate = Double(format[format.index(after: underscore)...]) {
+            return rate
+        }
+        return 24_000
+    }
+
+    private static func pcm16MonoToStereoFloat(_ data: Data, sourceSampleRate: Double = 0, targetSampleRate: Double = 0) -> [Float] {
         let sampleCount = data.count / 2
         if sampleCount == 0 {
             return []
         }
 
-        var out = [Float](repeating: 0, count: sampleCount * 2)
+        // Decode PCM16 mono to Float mono
+        var mono = [Float](repeating: 0, count: sampleCount)
         data.withUnsafeBytes { rawBuffer in
             let ptr = rawBuffer.bindMemory(to: Int16.self)
             for i in 0 ..< sampleCount {
-                let value = Float(ptr[i]) / Float(Int16.max)
-                out[i * 2] = value
-                out[i * 2 + 1] = value
+                mono[i] = Float(ptr[i]) / Float(Int16.max)
             }
+        }
+
+        // Resample if needed
+        let needsResample = sourceSampleRate > 0 && targetSampleRate > 0
+            && abs(sourceSampleRate - targetSampleRate) > 1.0
+        let resampled: [Float]
+        if needsResample {
+            let ratio = sourceSampleRate / targetSampleRate
+            let outCount = Int(Double(mono.count) / ratio)
+            var buf = [Float](repeating: 0, count: outCount)
+            var position = 0.0
+            for i in 0 ..< outCount {
+                let idx = Int(position)
+                let next = min(idx + 1, mono.count - 1)
+                let frac = Float(position - Double(idx))
+                buf[i] = mono[idx] * (1.0 - frac) + mono[next] * frac
+                position += ratio
+            }
+            resampled = buf
+        } else {
+            resampled = mono
+        }
+
+        // Expand mono to interleaved stereo
+        var out = [Float](repeating: 0, count: resampled.count * 2)
+        for i in 0 ..< resampled.count {
+            out[i * 2] = resampled[i]
+            out[i * 2 + 1] = resampled[i]
         }
         return out
     }
