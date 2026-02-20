@@ -2,6 +2,108 @@ import AppKit
 import Foundation
 import SwiftUI
 
+private let kMagic: UInt32 = 0x53415242
+private let kVersion: UInt32 = 1
+
+/// Read-only monitor that peeks at ring buffer audio levels without consuming data.
+private final class RingMonitor {
+    private static let headerBytes = 24
+
+    private var fd: Int32 = -1
+    private var mapping: UnsafeMutableRawPointer?
+    private var mappingSize: Int = 0
+    private var channels: UInt32 = 0
+    private var capacityFrames: UInt32 = 0
+
+    deinit {
+        close()
+    }
+
+    func open(name: String, channels: UInt32, capacityFrames: UInt32) -> Bool {
+        close()
+
+        guard !name.isEmpty, channels > 0, capacityFrames > 0 else { return false }
+
+        var pathName = name
+        if pathName.hasPrefix("/") { pathName.removeFirst() }
+        pathName = pathName.replacingOccurrences(of: "/", with: "_")
+        let backingFile = "/tmp/\(pathName).ring"
+
+        let opened = Darwin.open(backingFile, O_RDONLY)
+        guard opened >= 0 else { return false }
+
+        let mapSize = Self.headerBytes + Int(channels) * Int(capacityFrames) * MemoryLayout<Float>.size
+        let mapped = mmap(nil, mapSize, PROT_READ, MAP_SHARED, opened, 0)
+        if mapped == MAP_FAILED {
+            Darwin.close(opened)
+            return false
+        }
+
+        fd = opened
+        mapping = mapped
+        mappingSize = mapSize
+        self.channels = channels
+        self.capacityFrames = capacityFrames
+        return true
+    }
+
+    func close() {
+        if let mapping {
+            munmap(mapping, mappingSize)
+            self.mapping = nil
+        }
+        if fd >= 0 {
+            Darwin.close(fd)
+            fd = -1
+        }
+        mappingSize = 0
+        channels = 0
+        capacityFrames = 0
+    }
+
+    /// Peek at recent samples and return RMS level (0.0 to 1.0).
+    func peekLevel(peekFrames: Int = 480) -> Float {
+        guard let mapping, channels > 0, capacityFrames > 0 else { return 0 }
+
+        let ptr = mapping.assumingMemoryBound(to: UInt32.self)
+        let magic = ptr[0]
+        guard magic == kMagic else { return 0 }
+
+        let writeIndex = ptr[4]
+        let readIndex = ptr[5]
+        let available = writeIndex &- readIndex
+        if available == 0 { return 0 }
+
+        let framesToPeek = min(UInt32(peekFrames), min(available, capacityFrames))
+        let dataPtr = mapping.advanced(by: Self.headerBytes)
+            .bindMemory(to: Float.self, capacity: Int(channels * capacityFrames))
+
+        var sumSq: Float = 0
+        let totalChannels = Int(channels)
+        let startFrame = writeIndex &- framesToPeek
+
+        for frame in 0..<Int(framesToPeek) {
+            let ringFrame = Int((startFrame &+ UInt32(frame)) % capacityFrames)
+            let offset = ringFrame * totalChannels
+            for ch in 0..<totalChannels {
+                let sample = dataPtr[offset + ch]
+                sumSq += sample * sample
+            }
+        }
+
+        let count = Float(framesToPeek) * Float(totalChannels)
+        let rms = sqrtf(sumSq / max(count, 1))
+        return min(rms, 1.0)
+    }
+
+    /// Returns true if the ring header is valid and mapped.
+    var isOpen: Bool {
+        guard let mapping else { return false }
+        let ptr = mapping.assumingMemoryBound(to: UInt32.self)
+        return ptr[0] == kMagic
+    }
+}
+
 @MainActor
 final class CompanionViewModel: ObservableObject {
     enum EngineMode: String, CaseIterable, Identifiable {
@@ -16,12 +118,24 @@ final class CompanionViewModel: ObservableObject {
     @Published var mode: EngineMode = .apple
     @Published var status: String = "Disconnected"
     @Published var inputText: String = ""
-    @Published var outputText: String = ""
+    @Published var logText: String = ""
+    @Published var transcriptText: String = ""
+    @Published var sttRunning: Bool = false
+    @Published var micFeedLevel: Float = 0
+    @Published var speakerTapLevel: Float = 0
 
     private var socket: URLSessionWebSocketTask?
     private var receiveTask: Task<Void, Never>?
+    private var levelTask: Task<Void, Never>?
     private var finalTranscriptLines: [String] = []
     private var partialLine: String = ""
+
+    private let micFeedMonitor = RingMonitor()
+    private let speakerTapMonitor = RingMonitor()
+
+    init() {
+        startLevelMonitoring()
+    }
 
     func connect() {
         disconnect()
@@ -38,7 +152,7 @@ final class CompanionViewModel: ObservableObject {
         task.resume()
 
         status = "Connected"
-        appendOutput("[info] connected to \(url.absoluteString)")
+        appendLog("[info] connected to \(url.absoluteString)")
 
         receiveTask = Task { [weak self] in
             await self?.receiveLoop()
@@ -54,48 +168,36 @@ final class CompanionViewModel: ObservableObject {
             self.socket = nil
         }
 
+        sttRunning = false
         status = "Disconnected"
     }
 
     func sendText() {
         let trimmed = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else {
-            return
-        }
+        guard !trimmed.isEmpty else { return }
 
         let utteranceID = "u-\(Int(Date().timeIntervalSince1970 * 1000))"
-        send([
-            "type": "tts_start",
-            "utterance_id": utteranceID,
-        ])
-        send([
-            "type": "tts_chunk",
-            "utterance_id": utteranceID,
-            "text": trimmed,
-        ])
-        send([
-            "type": "tts_flush",
-            "utterance_id": utteranceID,
-        ])
+        send(["type": "tts_start", "utterance_id": utteranceID])
+        send(["type": "tts_chunk", "utterance_id": utteranceID, "text": trimmed])
+        send(["type": "tts_flush", "utterance_id": utteranceID])
 
-        appendOutput("[tts] sent utterance \(utteranceID)")
+        appendLog("[tts] sent utterance \(utteranceID)")
     }
 
     func startSTT() {
-        send([
-            "type": "start_stt",
-            "stream_id": "s1",
-            "language": "en-US",
-        ])
-        appendOutput("[stt] start requested")
+        finalTranscriptLines.removeAll()
+        partialLine = ""
+        transcriptText = ""
+        sttRunning = true
+
+        send(["type": "start_stt", "stream_id": "s1", "language": "en-US"])
+        appendLog("[stt] start requested")
     }
 
     func stopSTT() {
-        send([
-            "type": "stop_stt",
-            "stream_id": "s1",
-        ])
-        appendOutput("[stt] stop requested")
+        sttRunning = false
+        send(["type": "stop_stt", "stream_id": "s1"])
+        appendLog("[stt] stop requested")
     }
 
     func applySessionConfig() {
@@ -105,6 +207,32 @@ final class CompanionViewModel: ObservableObject {
             "stt_source": "virtual_speaker",
             "tts_target": "virtual_mic",
         ])
+    }
+
+    private func startLevelMonitoring() {
+        _ = micFeedMonitor.open(
+            name: "/virtual_audio_bridge_mic_feed",
+            channels: 2,
+            capacityFrames: 48000
+        )
+        _ = speakerTapMonitor.open(
+            name: "/virtual_audio_bridge_speaker_tap",
+            channels: 2,
+            capacityFrames: 48000
+        )
+
+        levelTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 50_000_000) // 50ms
+                guard let self else { break }
+                let mic = self.micFeedMonitor.peekLevel()
+                let spk = self.speakerTapMonitor.peekLevel()
+                await MainActor.run {
+                    self.micFeedLevel = mic
+                    self.speakerTapLevel = spk
+                }
+            }
+        }
     }
 
     private func send(_ object: [String: Any]) {
@@ -121,7 +249,7 @@ final class CompanionViewModel: ObservableObject {
             guard let self else { return }
             Task { @MainActor in
                 if let error {
-                    self.appendOutput("[error] send failed: \(error.localizedDescription)")
+                    self.appendLog("[error] send failed: \(error.localizedDescription)")
                 }
             }
         }
@@ -146,8 +274,9 @@ final class CompanionViewModel: ObservableObject {
                 if text.isEmpty { continue }
                 handleIncomingJSON(text)
             } catch {
-                appendOutput("[error] receive failed: \(error.localizedDescription)")
+                appendLog("[error] receive failed: \(error.localizedDescription)")
                 status = "Disconnected"
+                sttRunning = false
                 break
             }
         }
@@ -158,7 +287,7 @@ final class CompanionViewModel: ObservableObject {
               let object = try? JSONSerialization.jsonObject(with: data, options: []),
               let dict = object as? [String: Any]
         else {
-            appendOutput("[raw] \(text)")
+            appendLog("[raw] \(text)")
             return
         }
 
@@ -166,50 +295,52 @@ final class CompanionViewModel: ObservableObject {
 
         switch type {
         case "ready":
-            appendOutput("[info] bridge ready")
+            appendLog("[info] bridge ready")
             applySessionConfig()
         case "session_config_applied":
             let mode = (dict["mode"] as? String) ?? "unknown"
-            appendOutput("[info] session mode applied: \(mode)")
+            appendLog("[info] session mode applied: \(mode)")
         case "tts_status":
             let id = (dict["utterance_id"] as? String) ?? "?"
-            let status = (dict["status"] as? String) ?? "?"
+            let st = (dict["status"] as? String) ?? "?"
             let msg = (dict["message"] as? String) ?? ""
-            appendOutput("[tts] \(id) \(status) \(msg)")
+            appendLog("[tts] \(id) \(st) \(msg)")
         case "tts_alignment":
-            appendOutput("[tts] alignment event received")
+            break // silent
         case "stt_partial":
             partialLine = (dict["text"] as? String) ?? ""
-            refreshTranscriptOutput()
+            refreshTranscript()
         case "stt_final":
             if let text = dict["text"] as? String, !text.isEmpty {
                 finalTranscriptLines.append(text)
             }
             partialLine = ""
-            refreshTranscriptOutput()
+            refreshTranscript()
         case "error", "engine_error":
             let code = (dict["code"] as? String) ?? "unknown"
             let message = (dict["message"] as? String) ?? ""
-            appendOutput("[error] \(code): \(message)")
+            appendLog("[error] \(code): \(message)")
+        case "heartbeat", "engine_ready":
+            break // silent
         default:
-            appendOutput("[event] \(type.isEmpty ? "raw" : type)")
+            appendLog("[event] \(type.isEmpty ? "raw" : type)")
         }
     }
 
-    private func refreshTranscriptOutput() {
+    private func refreshTranscript() {
         var lines: [String] = []
-        lines.append(contentsOf: finalTranscriptLines.map { "[final] \($0)" })
+        lines.append(contentsOf: finalTranscriptLines)
         if !partialLine.isEmpty {
-            lines.append("[partial] \(partialLine)")
+            lines.append("... \(partialLine)")
         }
-        outputText = lines.joined(separator: "\n")
+        transcriptText = lines.joined(separator: "\n")
     }
 
-    private func appendOutput(_ line: String) {
-        if outputText.isEmpty {
-            outputText = line
+    private func appendLog(_ line: String) {
+        if logText.isEmpty {
+            logText = line
         } else {
-            outputText += "\n\(line)"
+            logText += "\n\(line)"
         }
     }
 }
@@ -222,11 +353,45 @@ final class BridgeCompanionAppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
+struct AudioLevelBar: View {
+    let label: String
+    let level: Float
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Text(label)
+                .font(.system(size: 11, weight: .medium, design: .monospaced))
+                .frame(width: 100, alignment: .trailing)
+            GeometryReader { geo in
+                ZStack(alignment: .leading) {
+                    RoundedRectangle(cornerRadius: 3)
+                        .fill(Color.gray.opacity(0.2))
+                    RoundedRectangle(cornerRadius: 3)
+                        .fill(barColor)
+                        .frame(width: max(0, geo.size.width * CGFloat(min(level * 5, 1.0))))
+                }
+            }
+            .frame(height: 12)
+            Text(String(format: "%.3f", level))
+                .font(.system(size: 10, design: .monospaced))
+                .frame(width: 50, alignment: .leading)
+        }
+    }
+
+    private var barColor: Color {
+        let scaled = level * 5
+        if scaled > 0.8 { return .red }
+        if scaled > 0.5 { return .yellow }
+        return .green
+    }
+}
+
 struct ContentView: View {
     @StateObject private var viewModel = CompanionViewModel()
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: 10) {
+            // Connection row
             HStack(spacing: 8) {
                 TextField("Host", text: $viewModel.host)
                     .textFieldStyle(.roundedBorder)
@@ -243,48 +408,87 @@ struct ContentView: View {
                 .pickerStyle(.segmented)
                 .frame(width: 220)
 
-                Button("Connect") {
-                    viewModel.connect()
-                }
-                Button("Disconnect") {
-                    viewModel.disconnect()
-                }
-                Button("Apply Mode") {
-                    viewModel.applySessionConfig()
-                }
+                Button("Connect") { viewModel.connect() }
+                Button("Disconnect") { viewModel.disconnect() }
+                Button("Apply Mode") { viewModel.applySessionConfig() }
             }
 
             Text("Status: \(viewModel.status)")
                 .font(.caption)
 
-            Text("Input")
+            // Audio levels
+            VStack(spacing: 4) {
+                AudioLevelBar(label: "Mic Feed", level: viewModel.micFeedLevel)
+                AudioLevelBar(label: "Speaker Tap", level: viewModel.speakerTapLevel)
+            }
+            .padding(.vertical, 4)
+
+            // TTS input
+            Text("TTS Input")
                 .font(.headline)
             TextEditor(text: $viewModel.inputText)
-                .frame(minHeight: 100)
+                .frame(minHeight: 60, maxHeight: 80)
                 .font(.system(size: 13, weight: .regular, design: .monospaced))
                 .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.gray.opacity(0.3)))
 
+            // Buttons
             HStack {
-                Button("Send TTS") {
-                    viewModel.sendText()
+                Button("Send TTS") { viewModel.sendText() }
+                Spacer().frame(width: 20)
+                Button(viewModel.sttRunning ? "Stop STT" : "Start STT") {
+                    if viewModel.sttRunning {
+                        viewModel.stopSTT()
+                    } else {
+                        viewModel.startSTT()
+                    }
                 }
-                Button("Start STT") {
-                    viewModel.startSTT()
-                }
-                Button("Stop STT") {
-                    viewModel.stopSTT()
+                .foregroundColor(viewModel.sttRunning ? .red : .primary)
+                if viewModel.sttRunning {
+                    Text("STT active")
+                        .font(.caption)
+                        .foregroundColor(.green)
                 }
             }
 
-            Text("Output")
-                .font(.headline)
-            TextEditor(text: $viewModel.outputText)
-                .frame(minHeight: 240)
-                .font(.system(size: 12, weight: .regular, design: .monospaced))
+            // STT Transcript
+            HStack {
+                Text("STT Transcript")
+                    .font(.headline)
+                Spacer()
+                if !viewModel.transcriptText.isEmpty {
+                    Button("Clear") {
+                        viewModel.transcriptText = ""
+                    }
+                    .font(.caption)
+                }
+            }
+            TextEditor(text: .constant(viewModel.transcriptText))
+                .frame(minHeight: 100)
+                .font(.system(size: 13, weight: .regular, design: .monospaced))
+                .overlay(RoundedRectangle(cornerRadius: 6).stroke(
+                    viewModel.sttRunning ? Color.green.opacity(0.6) : Color.gray.opacity(0.3),
+                    lineWidth: viewModel.sttRunning ? 2 : 1
+                ))
+
+            // Log
+            HStack {
+                Text("Log")
+                    .font(.headline)
+                Spacer()
+                if !viewModel.logText.isEmpty {
+                    Button("Clear") {
+                        viewModel.logText = ""
+                    }
+                    .font(.caption)
+                }
+            }
+            TextEditor(text: .constant(viewModel.logText))
+                .frame(minHeight: 120)
+                .font(.system(size: 11, weight: .regular, design: .monospaced))
                 .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.gray.opacity(0.3)))
         }
         .padding(14)
-        .frame(minWidth: 920, minHeight: 620)
+        .frame(minWidth: 920, minHeight: 720)
         .onAppear {
             NSApp.activate(ignoringOtherApps: true)
             NSApp.windows.first?.makeKeyAndOrderFront(nil)
